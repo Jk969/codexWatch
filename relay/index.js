@@ -47,7 +47,8 @@ function tokenUid(t) {
   if (!e) return null;
   if (typeof e === 'string') return e;                       // 兼容迁移前的写入
   if (Date.now() - e.ts > TOKEN_TTL) { delete db.tokens[t]; saveSoon(); return null; }
-  e.ts = Date.now(); saveSoon();                              // 滑动续期
+  // 滑动续期：每小时最多落盘一次，避免每个请求都重写整个 relay.json。
+  if (Date.now() - e.ts > 3600e3) { e.ts = Date.now(); saveSoon(); }
   return e.uid;
 }
 
@@ -59,7 +60,43 @@ function hashPw(pw, salt) {
   return salt + ':' + h;
 }
 function checkPw(pw, stored) {
-  try { const [s, h] = String(stored).split(':'); return crypto.scryptSync(String(pw), s, 32).toString('hex') === h; } catch { return false; }
+  try {
+    const [s, h] = String(stored).split(':');
+    const actual = crypto.scryptSync(String(pw ?? ''), s, 32);
+    const expected = Buffer.from(h, 'hex');
+    return expected.length === actual.length && crypto.timingSafeEqual(actual, expected);   // 常数时间比较
+  } catch { return false; }
+}
+// 生成当前未被占用的 6 位配对码：重复时设备会被绑到先生成该码的用户名下。
+function newPairCode() {
+  for (;;) {
+    const code = String(crypto.randomInt(100000, 1000000));
+    if (!db.pairCodes.some(p => p.code === code)) return code;
+  }
+}
+function revokeUserTokens(uid, keep) {
+  for (const t of Object.keys(db.tokens)) {
+    const e = db.tokens[t];
+    if ((typeof e === 'string' ? e : e && e.uid) === uid && t !== keep) delete db.tokens[t];
+  }
+}
+// reset-password.js 写入的待处理重置：中继运行时不能直接改 relay.json（会被内存数据覆盖）。
+const resetFile = path.join(DATA_DIR, 'pending-resets.json');
+function applyPendingResets() {
+  let list;
+  try { list = JSON.parse(fs.readFileSync(resetFile, 'utf8')); } catch { return; }
+  try { fs.rmSync(resetFile, { force: true }); } catch {}
+  let changed = false;
+  for (const r of Array.isArray(list) ? list : []) {
+    const user = db.users.find(u => u.name === r.name);
+    if (!user || typeof r.pw !== 'string' || !r.pw.includes(':')) continue;
+    user.pw = r.pw;
+    revokeUserTokens(user.id);
+    for (const ws of userSocks.get(user.id) || []) { try { ws.close(4001, 'password reset'); } catch {} }
+    changed = true;
+    log('已应用密码重置', user.name);
+  }
+  if (changed) save();
 }
 function cleanOld() {
   const now = Date.now();
@@ -98,6 +135,7 @@ bootstrap();
 
 // ---------------- 在线连接表 ----------------
 const userSocks = new Map();  // userId -> Set<ws>
+const sockById = new Map();   // 连接编号 -> ws（设备回执定向发送）
 const devSocks = new Map();   // deviceId -> ws
 const sockUser = new Map();   // ws -> {userId}
 const sockDev = new Map();    // ws -> {deviceId}
@@ -120,9 +158,9 @@ function pushDevices(userId) {
 }
 function pushDevicesOf(deviceId) { for (const uid of deviceUserIds(deviceId)) pushDevices(uid); }
 
-function queueNotify(userId, frame) {
+function queueNotify(userId, frame, deviceId) {
   db.queue[userId] = db.queue[userId] || [];
-  db.queue[userId].push({ frame, ts: Date.now() });
+  db.queue[userId].push({ frame, ts: Date.now(), deviceId });
   if (db.queue[userId].length > NOTIFY_CAP) db.queue[userId].splice(0, db.queue[userId].length - NOTIFY_CAP);
 }
 let saveTimer = null;
@@ -257,6 +295,16 @@ const server = http.createServer(async (req, res) => {
         if (!checkPw(b.oldPassword, au.user.pw)) return json(res, 400, { error: '原密码错误' });
         if (String(b.newPassword || '').length < 8) return json(res, 400, { error: '新密码至少 8 位' });
         au.user.pw = hashPw(b.newPassword);
+        // 改密后其他设备上的旧登录全部失效，只保留当前会话。
+        revokeUserTokens(au.user.id, au.token);
+        for (const ws of userSocks.get(au.user.id) || []) if (ws.cwToken !== au.token) { try { ws.close(4001, 'password changed'); } catch {} }
+        save();
+        return json(res, 200, { ok: true });
+      }
+      // 退出登录：服务端同时作废 token
+      if (u === '/api/logout' && req.method === 'POST') {
+        delete db.tokens[au.token];
+        for (const ws of userSocks.get(au.user.id) || []) if (ws.cwToken === au.token) { try { ws.close(4001, 'logout'); } catch {} }
         save();
         return json(res, 200, { ok: true });
       }
@@ -271,7 +319,7 @@ const server = http.createServer(async (req, res) => {
       // 生成设备配对码
       if (u === '/api/pair-code' && req.method === 'POST') {
         cleanOld();
-        const code = String(crypto.randomInt(100000, 999999));
+        const code = newPairCode();
         db.pairCodes.push({ code, userId: au.user.id, expiresAt: Date.now() + 10 * 60e3 });
         save();
         return json(res, 200, { code, expiresAt: Date.now() + 10 * 60e3 });
@@ -319,7 +367,7 @@ server.on('upgrade', (req, sock, head) => {
   if (u === '/ws') {
     const uid = tokenUid(t);
     if (!uid) { sock.destroy(); return; }
-    wss.handleUpgrade(req, sock, head, ws => onUserWs(ws, uid, q.get('power') === 'balanced'));
+    wss.handleUpgrade(req, sock, head, ws => { ws.cwToken = t; onUserWs(ws, uid, q.get('power') === 'balanced'); });
   } else {
     const dev = db.devices.find(d => d.token === t);
     if (!dev) { sock.destroy(); return; }
@@ -335,6 +383,8 @@ function onUserWs(ws, userId, balanced) {
   // 新 APK 降低锁屏心跳频率，旧版和电脑端维持原有协议。
   ws.cwHeartbeatMs = balanced ? 120000 : 25000;
   ws.cwLastPing = Date.now();
+  ws.cwId = crypto.randomBytes(9).toString('base64url');
+  sockById.set(ws.cwId, ws);
   sockUser.set(ws, userId);
   if (!userSocks.has(userId)) userSocks.set(userId, new Set());
   userSocks.get(userId).add(ws);
@@ -345,7 +395,8 @@ function onUserWs(ws, userId, balanced) {
   cleanOld();
   const q = db.queue[userId] || [];
   if (q.length) {
-    for (const n of q) sendWs(ws, Object.assign({ queued: true }, n.frame));
+    // 带上来源设备，客户端和 APK 才能准确定位聊天/匹配免打扰。
+    for (const n of q) sendWs(ws, Object.assign({ queued: true }, n.deviceId ? { deviceId: n.deviceId } : {}, n.frame));
     db.queue[userId] = [];
     saveSoon();
   }
@@ -358,7 +409,7 @@ function onUserWs(ws, userId, balanced) {
     }
     if (m.t === 'create_pair') {
       cleanOld();
-      const code = String(crypto.randomInt(100000, 999999));
+      const code = newPairCode();
       db.pairCodes.push({ code, userId, expiresAt: Date.now() + 10 * 60e3 });
       save();
       return sendWs(ws, { t: 'pair_code', code, expiresAt: Date.now() + 10 * 60e3 });
@@ -369,13 +420,15 @@ function onUserWs(ws, userId, balanced) {
         return sendWs(ws, { t: 'dev_frame', deviceId: m.deviceId, d: { t: 'err', ref: m.d && m.d.ref, error: '设备不存在或未配对' } });
       }
       const dws = devSocks.get(m.deviceId);
-      if (dws) sendWs(dws, { t: 'frame', d: m.d });
+      // 设备连接正在关闭时（close 事件尚未触发）也按离线处理，否则请求会被静默丢弃、手机端只能等超时。
+      if (dws && dws.readyState === 1) sendWs(dws, { t: 'frame', d: m.d, from: ws.cwId });
       else sendWs(ws, { t: 'dev_frame', deviceId: m.deviceId, d: { t: 'err', ref: m.d && m.d.ref, error: '设备不在线' } });
       return;
     }
   });
   const bye = () => {
     sockUser.delete(ws);
+    sockById.delete(ws.cwId);
     const set = userSocks.get(userId);
     if (set) { set.delete(ws); if (!set.size) userSocks.delete(userId); }
   };
@@ -406,11 +459,17 @@ function onDevWs(ws, deviceId, protocol) {
     if (m.t === 'frame' && m.d) {
       dev.lastSeen = Date.now();
       const uids = deviceUserIds(deviceId);
+      // 定向回执：只发给发起请求的连接，且该连接的用户仍与此设备配对。
+      if (typeof m.to === 'string') {
+        const target = sockById.get(m.to);
+        if (target && uids.includes(sockUser.get(target))) sendWs(target, { t: 'dev_frame', deviceId, d: m.d });
+        return;
+      }
       for (const uid of uids) {
         const set = userSocks.get(uid);
         const frame = { t: 'dev_frame', deviceId, d: m.d };
         if (set && set.size) { for (const s of set) sendWs(s, frame); }
-        else if (m.d.t === 'notify') { queueNotify(uid, m.d); saveSoon(); }
+        else if (m.d.t === 'notify') { queueNotify(uid, m.d, deviceId); saveSoon(); }
       }
       return;
     }
@@ -427,7 +486,11 @@ function onDevWs(ws, deviceId, protocol) {
 }
 
 setInterval(() => pingConnections(wss.clients, Date.now()), 5000);
+applyPendingResets();
+setInterval(applyPendingResets, 5000).unref();
 setInterval(cleanOld, 600e3).unref();
 
 server.listen(PORT, '127.0.0.1', () => log(`CodexWatch relay listening 127.0.0.1:${PORT}`));
 process.on('uncaughtException', e => log('uncaught', e.stack || e.message));
+// systemctl restart/stop 时把 2 秒防抖内尚未落盘的数据写入，避免丢失最近的设备/通知状态。
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { if (saveTimer) { clearTimeout(saveTimer); save(); } process.exit(0); });

@@ -7,15 +7,39 @@ const MAX_FILE = 20 * 1024 * 1024;
 const CHUNK = 64 * 1024;
 
 // 手机分片上传只写专用目录；调用方只能引用服务端生成的 ID，不能指定电脑路径。
+const INCOMPLETE_TTL = 3600e3;        // 未传完的分片 1 小时后清理
+const COMPLETE_TTL = 24 * 3600e3;     // 已完成附件 24 小时内可被消息引用
+const DISK_TTL = 7 * 24 * 3600e3;     // 磁盘上的附件文件保留 7 天（Codex 之后可能还要读取）
+
 class Attachments {
   constructor(root = path.join(os.homedir(), '.codex', 'codexwatch', 'attachments')) {
     this.root = root;
     this.entries = new Map();
+    this.sweepDisk();
+  }
+  // 启动时删除过期附件文件，避免目录无限增长。
+  sweepDisk(now = Date.now()) {
+    let names;
+    try { names = fs.readdirSync(this.root); } catch { return; }
+    for (const name of names) {
+      const file = path.join(this.root, name);
+      try { if (now - fs.statSync(file).mtimeMs > DISK_TTL) fs.rmSync(file, { force: true }); } catch {}
+    }
+  }
+  prune(now = Date.now()) {
+    for (const [id, e] of this.entries) {
+      if (!e.complete && now - e.ts > INCOMPLETE_TTL) { fs.rmSync(e.path, { force: true }); this.entries.delete(id); }
+      // 已完成的只从内存索引移除；文件保留给 Codex 读取，由 sweepDisk 按天清理。
+      else if (e.complete && now - e.ts > COMPLETE_TTL) this.entries.delete(id);
+    }
   }
   begin({ name, size, mime, chatId }) {
     if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_FILE) throw new Error('附件大小须在 1 字节至 20 MB 之间');
-    for (const [id, e] of this.entries) {
-      if (!e.complete && Date.now() - e.ts > 3600000) { fs.rmSync(e.path, { force: true }); this.entries.delete(id); }
+    this.prune();
+    // 之前已完成的附件永不移出索引，累计 1000 个后再也无法上传；现在只限制同时进行中的上传数量。
+    if (this.entries.size >= 1000) {
+      const done = [...this.entries.values()].filter(e => e.complete).sort((a, b) => a.ts - b.ts);
+      for (const e of done) { if (this.entries.size < 1000) break; this.entries.delete(e.id); }
     }
     if (this.entries.size >= 1000 || [...this.entries.values()].filter(e => !e.complete).length >= 10) throw new Error('附件上传数量过多，请稍后重试');
     name = String(name || '附件').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(-120).replace(/[. ]+$/, '') || '附件';
@@ -39,7 +63,7 @@ class Attachments {
   finish({ id }) {
     const e = this.entries.get(id);
     if (!e || e.bytes !== e.size) throw new Error('附件未完整上传');
-    e.complete = true;
+    e.complete = true; e.ts = Date.now();
     // 图片须同时有可支持的扩展名和文件头，不能靠客户端 MIME 冒充图片。
     const fd = fs.openSync(e.path, 'r');
     const head = Buffer.alloc(12); fs.readSync(fd, head, 0, 12, 0); fs.closeSync(fd);

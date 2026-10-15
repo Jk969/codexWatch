@@ -78,11 +78,17 @@ const S = {
   search: '',
   relayStatus: null,       // 本机模式:桥→云中继状态
   pendingPair: null,
+  helloed: new Set(),   // 本次连接已请求过全量状态的设备
 };
 S.muted = new Map(Object.entries(LS.get('muted', {}) || {}));
 S.archived = new Map(Object.entries(LS.get('archived', {}) || {}).map(([k, v]) => [k, Number(v) || Date.now()]));
 
-function persistMuted(){ LS.set('muted', Object.fromEntries(S.muted)); }
+function persistMuted(){ LS.set('muted', Object.fromEntries(S.muted)); syncNativeMuted(); }
+// APK 的系统通知由原生服务发出，需要把免打扰列表同步过去，否则免打扰只对页面内提示生效。
+function syncNativeMuted(){
+  if (!IS_APK || typeof CWApp.setMutedChats !== 'function') return;
+  try { CWApp.setMutedChats(JSON.stringify([...S.muted.keys()].filter(k=>S.muted.get(k)))); } catch(e){}
+}
 function persistArchived(){ LS.set('archived', Object.fromEntries(S.archived)); }
 function chatKey(dev, id){ return dev + '/' + id; }
 function totalUnread(){ let n=0; for(const v of S.unread.values()) n+=v; return n; }
@@ -97,7 +103,7 @@ const Conn = {
   // 业务帧:本地模式直接发;远程模式包一层 dev_frame
   send(frame, deviceId){
     if (IS_LOCAL) { this.raw(frame); return; }
-    const dev = deviceId || (frame.chatId ? frame.chatId.split('|')[0] : null) || activeDeviceId();
+    const dev = deviceId || (frame.chatId ? currentDevOfChat(frame.chatId) : null) || activeDeviceId();
     if (!dev) { toast('没有在线设备'); return; }
     this.raw({ t: 'dev_frame', deviceId: dev, d: frame });
   },
@@ -118,7 +124,7 @@ const Conn = {
     this.ws = ws;
     ws.onopen = () => { this.retry = 0; setConn('connected'); if (IS_LOCAL) this.raw({ t: 'hello' }); };
     ws.onmessage = (ev) => { let m; try{ m = JSON.parse(ev.data); }catch{ return; } onNetMessage(m); };
-    ws.onclose = () => { if (this.ws === ws && !this.manualClose) this.scheduleRetry(); };
+    ws.onclose = () => { if (this.ws !== ws) return; failPendingFrames(); if (!this.manualClose) this.scheduleRetry(); };
     ws.onerror = () => {};
   },
   scheduleRetry(){
@@ -163,7 +169,10 @@ function onNetMessage(m){
       S.devicesReady=true;S.deviceError=null;
       S.devices = m.devices || [];
       if (!IS_LOCAL) {
-        for (const d of S.devices) if (d.online) Conn.send({ t: 'hello' }, d.id);
+        // 只向新上线/本次连接尚未同步过的电脑要全量状态；心跳和设备列表刷新不再触发全量回传。
+        const online = new Set(S.devices.filter(d=>d.online).map(d=>d.id));
+        for (const id of [...S.helloed]) if (!online.has(id)) S.helloed.delete(id);
+        if (S.conn === 'connected') for (const id of online) if (!S.helloed.has(id)) { S.helloed.add(id); Conn.send({ t: 'hello' }, id); }
       }
       if(S.tab==='devices')renderDevices();else if(S.tab==='me')renderMe();else if(S.tab==='chats')renderChatList();
       break;
@@ -174,7 +183,7 @@ function onNetMessage(m){
       S.pendingPair = m;
       showPairPanel();
       break;
-    case 'notify': onNotify(m.d, m.queued); break;
+    case 'notify': onNotify(m.d, m.queued, m.deviceId); break;
     case 'pong': break;
   }
   updateConnDot();
@@ -202,6 +211,10 @@ function handleFrame(d, dev){
     }
   }
   switch (d.t) {
+    case 'notify':
+      // 实时通知包在 dev_frame 内；离线补发才是顶层 notify。
+      onNotify(d.d, false, dev);
+      break;
     case 'models_changed':
       modelCatalogs.delete(IS_LOCAL ? 'local' : dev);
       break;
@@ -234,7 +247,8 @@ function handleFrame(d, dev){
       if (identity && items && items.some(x => (x.iid || x.id) === identity)) break;
       if (S.items.has(k)) S.items.get(k).push(d.item);
       if (S.opened !== k) {
-        if (!chatIsMuted(k)) S.unread.set(k, (S.unread.get(k)||0)+1);
+        // 只有 Codex 回复、提问、授权和错误计入未读；工具调用/思考过程不刷屏。
+        if (!chatIsMuted(k) && UNREAD_KINDS.has(d.item.k)) S.unread.set(k, (S.unread.get(k)||0)+1);
         renderChatList(); updateTabBadge();
       } else { appendChatItem(d.item); }
       break;
@@ -244,7 +258,8 @@ function handleFrame(d, dev){
       const k = chatKey(dev, d.chatId);
       const items = S.items.get(k);
       if (items) {
-        const idx = items.findIndex(x => x === d.item || (d.item.iid && x.iid === d.item.iid));
+        const key = itemKey(d.item);
+        const idx = key ? items.findIndex(x => itemKey(x) === key) : -1;
         if (idx >= 0) items[idx] = d.item;
       }
       if (S.opened === k) refreshChatItem(d.item);
@@ -265,7 +280,7 @@ function handleFrame(d, dev){
       else if (d.mode === 'local_queue' || d.mode === 'queued') toast('已加入队列,稍后自动执行');
       break;
     case 'answer_result':
-      if (!d.ok) toast(esc(d.error || '操作失败'), 3200);
+      if (!d.ok && !(d.ref && String(d.ref).startsWith('req-'))) toast(esc(d.error || '操作失败'), 3200);
       break;
     case 'task_submitted':
       if (!d.ok) toast(esc(d.error || '任务发起失败'));
@@ -295,15 +310,16 @@ function handleFrame(d, dev){
   }
 }
 
-function onNotify(d, queued){
+function onNotify(d, queued, dev){
   if (!d) return;
-  const k = d.chatId ? chatKey(currentDevOfChat(d.chatId), d.chatId) : null;
+  const k = d.chatId ? chatKey(dev && dev !== 'local' && !IS_LOCAL ? dev : currentDevOfChat(d.chatId), d.chatId) : null;
   if (k && S.chats.has(k)) {
     const c = S.chats.get(k);
     if (c.lastTs < (d.ts||Date.now())) { /* 摘要可能还没更新 */ }
   }
   if (k && (S.muted.get(k) || S.archived.has(k))) return;
-  if (k && S.opened !== k) {
+  // 实时消息已由 item 计入未读；只有离线期间补发的通知需要补计。
+  if (k && S.opened !== k && queued) {
     S.unread.set(k, (S.unread.get(k)||0)+1);
     renderChatList(); updateTabBadge();
   }
@@ -319,7 +335,7 @@ function currentDevOfChat(chatId){
 }
 
 /* ================= 连接状态 ================= */
-function setConn(st){ S.conn = st; updateConnDot(); }
+function setConn(st){ S.conn = st; if (st !== 'connected') S.helloed.clear(); updateConnDot(); }
 function updateConnDot(){
   const dot = $('conn-dot');
   if (IS_LOCAL) {
@@ -502,7 +518,7 @@ function openArchivedPanel(){
 function openChat(k){
   const c = S.chats.get(k);
   if (!c) return;
-  S.opened = k;
+  S.opened = k; chatLimit = CHAT_PAGE;
   navStack = navStack.filter(id => id !== 'chat'); navStack.push('chat');
   $('chat-input').value = draftFor(k).text;
   renderComposer();
@@ -565,8 +581,9 @@ document.addEventListener('selectionchange',()=>{
 });
 function refreshChatItem(item){
   const body = $('chat-body');
-  if (!item.iid) return;
-  const el = body.querySelector(`[data-iid="${CSS.escape(item.iid)}"]`);
+  const key = itemKey(item);
+  if (!key) return;
+  const el = body.querySelector(`[data-iid="${CSS.escape(key)}"]`);
   if (el) {if(chatSelectionActive()){selectionRefreshPending=true;return;}el.outerHTML = itemHtml(item, S.chats.get(S.opened));}
 }
 // 每聊天的模型/思考设置
@@ -584,7 +601,7 @@ function openPermissionPanel(){
 }
 function approvalHtml(it){
   const decided = it.decision != null;
-  const decisionText = { accept: '已允许', acceptForSession: '已允许(本会话不再询问)', decline: '已拒绝', cancel: '已拒绝并停止' }[it.decision] || String(it.decision||'');
+  const decisionText = { accept: '已允许', acceptForSession: '已允许(本会话不再询问)', decline: '已拒绝', cancel: '已拒绝并停止', expired: '已失效' }[it.decision] || String(it.decision||'');
   const btns = decided ? '' : `
     <div class="ap-actions">
       <button class="ap-btn primary" data-req="${esc(it.reqId)}" data-dec="accept">允许</button>
@@ -592,8 +609,8 @@ function approvalHtml(it){
       <button class="ap-btn danger" data-req="${esc(it.reqId)}" data-dec="decline">拒绝</button>
       <button class="ap-btn danger" data-req="${esc(it.reqId)}" data-dec="cancel">拒绝并停止</button>
     </div>`;
-  const doneLine = decided ? `<div class="ap-done"><span class="${/accept/.test(it.decision)?'ok':'no'}">${decisionText}</span></div>` : '';
-  return `<div class="msg ai" data-iid="${esc(it.iid||'')}"><div class="m-avatar"></div><div class="bubble-wrap"><div class="approval-card">
+  const doneLine = decided ? `<div class="ap-done"><span class="${/^accept/.test(it.decision)?'ok':'no'}">${decisionText}</span></div>` : '';
+  return `<div class="msg ai" data-iid="${esc(itemKey(it))}"><div class="m-avatar"></div><div class="bubble-wrap"><div class="approval-card">
     <div class="ap-head"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 8v5M12 16v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><span class="nm">${esc(it.title||'命令授权')}</span></div>
     <div class="ap-body"><div class="ap-cmd">${esc(it.command||'')}</div>${it.cwd?`<div class="ap-cwd">📁 ${esc(it.cwd)}</div>`:''}${btns}${doneLine}</div>
   </div></div></div>`;
@@ -611,7 +628,7 @@ function askHtml(it){
     </div>`).join('');
   const answerLine = answered ? `<div class="ap-done"><span class="ok">${it.submitted?'已提交回答':'已回答'}:${esc((it.answers||[]).join(' / ').slice(0,200))}</span></div>` : desktopOnly ? '<div class="ap-done">请在电脑端回答此同步提问。</div>' : `
     <div class="ask-free">${multi?'':`<input placeholder="输入回答,或直接点选项…" data-req="${esc(it.reqId)}">`}${multi?`<button data-sendmulti="1" data-req="${esc(it.reqId)}">提交全部回答</button>`:`<button data-send="1" data-req="${esc(it.reqId)}">发送</button>`}</div>`;
-  return `<div class="msg ai" data-iid="${esc(it.iid||'')}"><div class="m-avatar"></div><div class="bubble-wrap"><div class="ask-card">
+  return `<div class="msg ai" data-iid="${esc(itemKey(it))}"><div class="m-avatar"></div><div class="bubble-wrap"><div class="ask-card">
     <div class="ask-head"><span class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.4 2.3c-.8.3-.9 1-.9 1.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="16.5" r="1" fill="currentColor"/></svg></span><span class="nm">Codex 提问${it.blocking?' · 需要回答':''}</span></div>
     <div class="ask-body">${qs}${answerLine}</div>
   </div></div></div>`;
@@ -623,6 +640,12 @@ async function submitQuestion(reqId, answers, card){
   catch(e){toast(esc(e.message),4000);}
   finally{delete card.dataset.busy;card.querySelectorAll('button,input').forEach(x=>x.disabled=false);}
 }
+// 渲染/刷新用的稳定标识：app-server 条目有 iid，会话文件条目只有 id，个别工具只有 callId。
+function itemKey(it){ return it ? String(it.iid || it.id || (it.callId ? 'call:' + it.callId : '')) : ''; }
+const UNREAD_KINDS = new Set(['agent', 'askuser', 'approval', 'err']);
+// 长会话只渲染最近 CHAT_PAGE 条，点击再向前展开，避免一次生成数千个 DOM 节点。
+const CHAT_PAGE = 200;
+let chatLimit = CHAT_PAGE;
 function itemHtml(it, c){
   const av = CODEX_AVATAR;
   const uav = `<div class="img" style="background:linear-gradient(135deg,#07C160,#0ABF56)">${esc(((S.user&&S.user.name)||'我').charAt(0))}</div>`;
@@ -630,9 +653,9 @@ function itemHtml(it, c){
     case 'user':
       return `<div class="msg user"><div class="m-avatar">${uav}</div><div class="bubble-wrap">${it.source?`<div class="message-source">${it.source==='mobile_forward'?'手机消息 · 经桌面转发':'其他聊天转发'}</div>`:''}<div class="bubble">${esc(it.t)}</div></div></div>`;
     case 'agent':
-      return `<div class="msg ai" data-iid="${esc(it.iid||'')}"><div class="m-avatar">${av}</div><div class="bubble-wrap"><div class="bubble bubble-md">${mdToHtml(it.t)}</div></div></div>`;
+      return `<div class="msg ai" data-iid="${esc(itemKey(it))}"><div class="m-avatar">${av}</div><div class="bubble-wrap"><div class="bubble bubble-md">${mdToHtml(it.t)}</div></div></div>`;
     case 'reason':
-      return `<div class="msg ai"><div class="m-avatar"></div><div class="bubble-wrap"><div class="reason"><span class="rl">思考</span>${esc((it.t||'').slice(0,300))}</div></div></div>`;
+      return `<div class="msg ai" data-iid="${esc(itemKey(it))}"><div class="m-avatar"></div><div class="bubble-wrap"><div class="reason"><span class="rl">思考</span>${esc((it.t||'').slice(0,300))}</div></div></div>`;
     case 'err':
       return `<div class="sysline err"><span>⚠ ${esc(it.t)}</span></div>`;
     case 'sys':
@@ -644,7 +667,7 @@ function itemHtml(it, c){
     case 'tool': {
       const args = esc(it.args || '');
       const out = it.out ? `<div class="tool-out">${esc(it.out)}</div>` : '';
-      return `<div class="msg ai" data-iid="${esc(it.iid||'')}"><div class="m-avatar"></div><div class="bubble-wrap"><div class="tool-card" data-x="0">
+      return `<div class="msg ai" data-iid="${esc(itemKey(it))}"><div class="m-avatar"></div><div class="bubble-wrap"><div class="tool-card" data-x="0">
         <div class="tool-head"><span class="ic"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a5 5 0 0 0-6.6 6.6L3 18l3 3 5.1-5.1a5 5 0 0 0 6.6-6.6l-3.2 3.2-2.5-.5-.5-2.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></span><span class="nm">${esc(it.name||'tool')}</span></div>
         <div class="tool-body"><div class="tool-args">${args}</div>${out}</div>
       </div></div></div>`;
@@ -666,8 +689,11 @@ function renderChatView(preserveScroll = false){
   if (items.length === 0 && S.loaded.has(S.opened)) {
     html += `<div class="time-pill">会话没有可显示的消息</div>`;
   }
+  const start = Math.max(0, items.length - chatLimit);
+  if (start > 0) html += `<div class="time-pill" data-more="1" style="cursor:pointer;color:#576B95">显示更早的 ${start} 条消息</div>`;
   let lastTs = 0;
-  for (const it of items) {
+  for (let i = start; i < items.length; i++) {
+    const it = items[i];
     if (it.ts && it.ts - lastTs > 5 * 60e3) html += `<div class="time-pill">${dayLabel(it.ts)}</div>`;
     if (it.ts) lastTs = it.ts;
     html += itemHtml(it, c);
@@ -684,7 +710,12 @@ function appendChatItem(it){
   const c = S.chats.get(S.opened);
   if (running && c && c.status !== 'running') running.closest('.msg').remove();
   else if (running) running.closest('.msg').remove();
-  body.insertAdjacentHTML('beforeend', `<div class="time-pill">${dayLabel(it.ts||Date.now())}</div>` + itemHtml(it, c));
+  // 与整页渲染一致：距上一条有时间的消息超过 5 分钟才插入时间条。
+  const list = S.items.get(S.opened) || [];
+  let prevTs = 0;
+  for (let i = list.lastIndexOf(it) - 1; i >= 0; i--) if (list[i].ts) { prevTs = list[i].ts; break; }
+  const pill = it.ts && it.ts - prevTs > 5 * 60e3 ? `<div class="time-pill">${dayLabel(it.ts)}</div>` : '';
+  body.insertAdjacentHTML('beforeend', pill + itemHtml(it, c));
   if (!chatSelectionActive()&&(nearBottom || it.k === 'user')) sc.scrollTop = sc.scrollHeight;
   if (c && c.status === 'running') body.insertAdjacentHTML('beforeend', `<div class="msg ai"><div class="m-avatar">${CODEX_AVATAR}</div><div class="bubble-wrap"><div class="bubble" style="padding:0"><div class="typing"><i></i><i></i><i></i></div></div></div></div>`);
 }
@@ -900,9 +931,13 @@ function renderMe(){
   $('me-pass').onclick = ()=>openChangePassword();
   $('me-logout').onclick = ()=>{
     if (IS_LOCAL) { Conn.send({t:'hello'}); toast('已刷新'); renderChatList(); return; }
-    wsToken = null; LS.set('token', null);
-    if (IS_APK) { try{ CWApp.setConfig(JSON.stringify({endpoint: wsUrl(), token: ''})); CWApp.disconnect(); }catch(e){} }
-    location.reload();
+    // 先让服务器作废令牌（最多等 1.5 秒），否则旧令牌仍可使用到自然过期。
+    const revoke = wsToken ? api('/api/logout', {}).catch(()=>{}) : Promise.resolve();
+    Promise.race([revoke, new Promise(r=>setTimeout(r, 1500))]).then(()=>{
+      wsToken = null; LS.set('token', null);
+      if (IS_APK) { try{ CWApp.setConfig(JSON.stringify({endpoint: wsUrl(), token: ''})); CWApp.disconnect(); }catch(e){} }
+      location.reload();
+    });
   };
 }
 let usageDevice = null, usageData = null, usageBusy = false;
@@ -973,14 +1008,14 @@ function openNotifySettings(){
 function openChangePassword(){
   const html = `<div class="form-section" style="margin-top:10px">
     <div class="form-cell"><div class="fl">原密码</div><input id="cp-old" type="password"></div>
-    <div class="form-cell"><div class="fl">新密码</div><input id="cp-new" type="password" placeholder="至少6位"></div>
+    <div class="form-cell"><div class="fl">新密码</div><input id="cp-new" type="password" placeholder="至少8位"></div>
     <div class="form-cell"><div class="fl">确认新密码</div><input id="cp-new2" type="password"></div>
   </div><button class="btn-primary" id="cp-submit">保 存</button>`;
   openSubpanel('修改密码', html);
   $('cp-submit').onclick = async ()=>{
     const o = $('cp-old').value, n = $('cp-new').value, n2 = $('cp-new2').value;
     if (n !== n2) return toast('两次输入的新密码不一致');
-    if (n.length < 6) return toast('新密码至少 6 位');
+    if (n.length < 8) return toast('新密码至少 8 位');
     try {
       await api('/api/change-password', { oldPassword: o, newPassword: n });
       toast('密码已修改'); closeOverlay('subpanel');
@@ -1016,6 +1051,11 @@ const modelLoads = new Map();
 const frameRequests = new Map();
 const drafts = new Map();
 let navStack = [];
+// 通道断开时立即让在途请求失败，而不是让界面卡 30 秒等超时。
+function failPendingFrames(){
+  for(const pending of frameRequests.values()){clearTimeout(pending.timer);pending.reject(new Error('实时通道断开，文字已保留；请确认任务状态后重试'));}
+  frameRequests.clear();
+}
 function requestFrame(frame, dev){
   if(IS_APK && !CWApp.isConnected())setConn('offline');
   if (S.conn !== 'connected') return Promise.reject(new Error('实时通道未连接，请先重连'));
@@ -1414,11 +1454,16 @@ async function sendChatMessage(){
     for(const a of d.files){
       if(a.id||a.localPath)continue;
       const begin=await requestFrame({t:'upload_begin',chatId:c.id,name:a.file.name,size:a.file.size,mime:a.file.type},c._dev);
+      // 同一 WebSocket 保序，可同时在途 4 个分片，避免每 64KB 等一次往返。
+      const inflight=[];
       for(let offset=0,index=0;offset<a.file.size;offset+=65536,index++){
         const data=await readBase64(a.file.slice(offset,offset+65536));
-        await requestFrame({t:'upload_chunk',id:begin.id,index,data},c._dev);
-        a.progress='上传 '+Math.min(100,Math.round((offset+65536)/a.file.size*100))+'%'; if(S.opened===key)renderComposer();
+        const sent=Math.min(a.file.size,offset+65536);
+        const p=requestFrame({t:'upload_chunk',id:begin.id,index,data},c._dev).then(()=>{a.progress='上传 '+Math.round(sent/a.file.size*100)+'%';if(S.opened===key)renderComposer();});
+        p.catch(()=>{});inflight.push(p);
+        if(inflight.length>=4)await inflight.shift();
       }
+      await Promise.all(inflight);
       const final=await requestFrame({t:'upload_finish',id:begin.id},c._dev);a.id=final.id;a.progress='已上传';
     }
     const tune=chatTune(key); const text=d.text.trim()||'请查看附带的文件和图片。';
@@ -1547,7 +1592,7 @@ function openChatMenu(){
       $('chat-menu-mask').classList.add('hidden');
       const id = el.dataset.id;
       if (id === 'stop') Conn.send({t:'stop_task', chatId: c.id}, c._dev);
-      if (id === 'copy') { navigator.clipboard && navigator.clipboard.writeText(c.id); toast('已复制'); }
+      if (id === 'copy') copyAnyText(c.id);
       if (id === 'info') openSubpanel('任务信息', `<div class="cells">
           <div class="cell"><div class="c-main"><div class="c-name">标题</div><div class="c-sub">${esc(c.title)}</div></div></div>
           <div class="cell"><div class="c-main"><div class="c-name">工作目录</div><div class="c-sub">${esc(c.cwd)}</div></div></div>
@@ -1659,6 +1704,12 @@ function bindEvents(){
 
   // 工具卡片展开/收起 + 授权/提问交互(事件委托)
   $('chat-body').addEventListener('click', (e)=>{
+    if (e.target.closest('[data-more]')) {
+      const sc = $('chat-scroll'), fromBottom = sc.scrollHeight - sc.scrollTop;
+      chatLimit += CHAT_PAGE; renderChatView(true);
+      sc.scrollTop = sc.scrollHeight - fromBottom;
+      return;
+    }
     const copy=e.target.closest('.md-copy');
     if(copy){copyMarkdownCode(copy);return;}
     const card = e.target.closest('.tool-card'); if (card) {
@@ -1671,9 +1722,14 @@ function bindEvents(){
     }
     const apBtn = e.target.closest('.ap-btn[data-req]');
     if (apBtn) {
-      apBtn.disabled = true;
-      Conn.send({ t: 'answer_approval', reqId: apBtn.dataset.req, decision: apBtn.dataset.dec });
+      const chat = S.chats.get(S.opened);
+      if (!chat) return;
+      const btns = apBtn.closest('.ap-actions')?.querySelectorAll('.ap-btn') || [apBtn];
+      btns.forEach(b=>b.disabled=true);
       toast('<span class="spin"></span>已发送决定…', 1500);
+      // 必须发给该聊天所在的电脑；多台电脑时旧逻辑会发到第一台在线设备。
+      requestFrame({ t: 'answer_approval', chatId: chat.id, reqId: apBtn.dataset.req, decision: apBtn.dataset.dec }, chat._dev)
+        .catch(err=>{ btns.forEach(b=>b.disabled=false); toast(esc(err.message), 3200); });
       return;
     }
     const askOpt = e.target.closest('.ask-opt[data-req]');
@@ -1731,9 +1787,8 @@ window.__cwonmessage = (s)=>{ let m; try{ m = typeof s === 'string' ? JSON.parse
 window.__cwstatus = (s)=>{ let m; try{ m = typeof s === 'string' ? JSON.parse(s) : s; }catch{ return; }
   if (m && m.connected) { S.conn='connected'; S.sockError=null;syncDevices(); }
   else {
-    S.conn='offline'; S.sockError = (m && m.error) || null;
-    for(const pending of frameRequests.values()){clearTimeout(pending.timer);pending.reject(new Error('实时通道断开，文字已保留；请确认任务状态后重试'));}
-    frameRequests.clear();
+    S.conn='offline'; S.sockError = (m && m.error) || null; S.helloed.clear();
+    failPendingFrames();
   }
   updateConnDot();
 };
@@ -1743,7 +1798,10 @@ window.__cwdeeplink = (chatId)=>{
 };
 
 /* ================= 启动 ================= */
+let booted = false;
 function boot(){
+  if (booted) return; booted = true;
+  syncNativeMuted();
   bindEvents();
   bindLogin();
   if (IS_LOCAL) {

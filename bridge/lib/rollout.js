@@ -2,7 +2,9 @@
 // rollout-*.jsonl 行解析:把 Codex 的 rollout 事件翻译为 UI 友好的 item / 状态变化。
 // 设计原则:对未知字段与未知事件类型一律宽容跳过,保证跨版本稳健。
 
-const XML_BLOCK = /<(environment_context|user_instructions|ENVIRONMENT_CONTEXT|USER_INSTRUCTIONS)[\s\S]*?<\/\1>/g;
+const XML_BLOCK = /<(environment_context|user_instructions|ENVIRONMENT_CONTEXT|USER_INSTRUCTIONS|INSTRUCTIONS|turn_aborted|user_shell_command)[\s\S]*?<\/\1>/g;
+// Codex 自动注入的上下文消息（AGENTS.md、环境信息等）以 user 角色写入 rollout，不是用户真正发的指令。
+const INJECTED_PREFIX = /^\s*(?:# AGENTS\.md instructions for |<environment_context>|<user_instructions>|<INSTRUCTIONS>)/;
 
 function safeJson(s) { try { return JSON.parse(s); } catch { return undefined; } }
 
@@ -40,7 +42,8 @@ function contentText(content) {
   for (const c of content) {
     if (!c) continue;
     if (typeof c === 'string') { out += c; continue; }
-    if (c.type === 'input_text' || c.type === 'output_text' || c.type === 'text') out += c.text || '';
+    // reasoning.summary 用 summary_text，reasoning.content 用 reasoning_text
+    if (c.type === 'input_text' || c.type === 'output_text' || c.type === 'text' || c.type === 'summary_text' || c.type === 'reasoning_text') out += (out && (c.type === 'summary_text') ? '\n\n' : '') + (c.text || '');
     else if (c.type === 'input_image') out += '[图片]';
   }
   return out;
@@ -53,6 +56,7 @@ function cleanUserText(t) {
 function userInput(text, id, ts, source) {
   const reply = text.match(/<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>/);
   if (reply) { const answers = safeJson(reply[1]); if (Array.isArray(answers)) return { questionAnswers:answers }; }
+  if (!source && INJECTED_PREFIX.test(text)) return null;
   const cleaned = cleanUserText(text);
   if (!cleaned) return null;
   return { item: { id: id || null, k: 'user', ts, t: cleaned.slice(0, 4000), ...(source ? {source} : {}) } };

@@ -61,6 +61,13 @@ fi
 rm -rf -- "$BUILD"
 mkdir -p "$BUILD/classes" "$BUILD/gen" "$ROOT_DIR/dist"
 
+# web/ 是网页唯一源码；打包前同步到 assets，避免 APK 内置旧版前端。
+if [[ -f "$ROOT_DIR/web/index.html" ]]; then
+  rm -rf -- "$APP_DIR/src/assets/www"
+  mkdir -p "$APP_DIR/src/assets/www"
+  cp -r "$ROOT_DIR/web/." "$APP_DIR/src/assets/www/"
+fi
+
 # Windows 下 javac/java 等原生工具的参数使用相对路径最稳(MSYS 不做改写)
 cd "$BUILD"
 TOOLS_REL="../../.tools"           # BUILD = <root>/app/build -> <root>/.tools

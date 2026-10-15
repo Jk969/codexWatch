@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "start-hidden": "node index.js --quiet"
+    "start-hidden": "node index.js --quiet",
+    "test": "node --test --test-concurrency=1 test/account-reload-test.js test/approval-selection-test.js test/compact-test.js test/composer-shortcuts-test.js test/delegation-history-test.js test/directories-test.js test/markdown-test.js test/mobile-features-test.js test/questions-test.js test/relay-protocol-test.js test/relay-recovery-test.js test/send-history-test.js test/status-sync-test.js test/usage-test.js test/review-fixes-test.js",
+    "test:live": "node --test --test-concurrency=1 test/interactive-test.js test/task-flow-test.js test/remote-e2e-test.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

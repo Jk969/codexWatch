@@ -389,6 +389,14 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void setMutedChats(String json) {
+            try {
+                GatewayService.writeMutedChats(MainActivity.this, json);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        @JavascriptInterface
         public boolean copyText(String text) {
             try {
                 ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
