@@ -22,12 +22,15 @@ function findCodexJs() {
   if (process.env.CODEXWATCH_CODEX_JS) return process.env.CODEXWATCH_CODEX_JS;
   const cands = [];
   try {
-    const out = execSync(IS_WIN ? 'where codex.cmd' : 'which codex', { encoding: 'utf8' });
+    const out = execSync(IS_WIN ? 'where codex.cmd' : 'which codex', { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
     for (const line of out.split('\n')) {
       const p = line.trim();
       if (!p) continue;
       const dir = path.dirname(p);
       cands.push(path.join(dir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js'));
+      // macOS/Linux 的 bin/codex 通常是指向 codex.js 的软链接
+      try { const real = fs.realpathSync(p); if (/codex\.js$/.test(real)) cands.unshift(real); } catch {}
+      cands.push(path.join(dir, '..', 'lib', 'node_modules', '@openai', 'codex', 'bin', 'codex.js'));
     }
   } catch {}
   cands.push(path.join('D:', 'soft', 'nvm4w', 'nodejs', 'node_modules', '@openai', 'codex', 'bin', 'codex.js'));
@@ -45,12 +48,16 @@ class Runner extends EventEmitter {
     this.spawnedByChat = new Map(); // chatId -> spawn record
     store.on('chat_appear', (chat) => this.tryBindNew(chat));
     store.on('chat_update', (s) => this.tryBindRunning(s));
-    store.on('notify', (n) => { if (n.level === 'done') this.drainPending(n.chatId); });
+    // 完成/出错后继续发送排队消息；被中断视为用户主动停止，取消排队并提示原文，避免消息永远卡在队列里。
+    store.on('notify', (n) => {
+      if (n.level === 'done' || n.level === 'error') this.drainPending(n.chatId);
+      else if (n.level === 'warn') this.cancelPending(n.chatId, '任务已中断');
+    });
     log('[runner] codex.js =', this.codexJs || '(未找到,降级 cmd)');
   }
 
   spawnCodex(args, opts) {
-    const base = { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }; // stdin 必须忽略:codex exec 会尝试读 stdin
+    const base = { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], detached: !IS_WIN }; // stdin 必须忽略:codex exec 会尝试读 stdin；非 Windows 独立进程组便于整组停止
     if (this.codexJs) {
       return spawn(process.execPath, [this.codexJs, ...args], Object.assign(base, opts));
     }
@@ -79,6 +86,8 @@ class Runner extends EventEmitter {
     for (const file of attachments.filter(f => f.image)) args.push('--image', file.path);
     const lastMsgFile = path.join(os.tmpdir(), 'cw-lastmsg-' + ref + '.txt');
     args.push('-o', lastMsgFile);
+    // 以 "-" 开头的指令（如 "-h 是什么意思"）会被当成命令行参数，用 "--" 结束选项解析。
+    if (prompt.startsWith('-')) args.push('--');
     args.push(prompt);
 
     let child;
@@ -108,6 +117,13 @@ class Runner extends EventEmitter {
   onChildExit(rec, code) {
     rec.confirmStart({ ok: false, error: startupError(rec.stderr, code) });
     this.pending.delete(rec.ref);
+    // -o 输出的最后一条消息只用于调试，进程退出后删除，避免临时目录堆积。
+    fs.unlink(rec.lastMsgFile, () => {});
+    // resume 很快结束时，轮询可能还没看到 running 状态就退出了：正常退出不算启动失败。
+    if (!rec.boundChatId && rec.resumeOf && code === 0) {
+      setTimeout(() => this.drainPending(rec.resumeOf), 1500).unref();
+      return;
+    }
     if (!rec.boundChatId) {
       // 没有产生会话文件 → 启动失败,直接通知
       if (code !== 0) {
@@ -218,7 +234,25 @@ class Runner extends EventEmitter {
     const entry = chat.pendingMsgs.shift();
     const text = typeof entry === 'string' ? entry : entry.text;
     const opts = typeof entry === 'string' ? {} : entry.opts;
-    setImmediate(() => this.sendMsg(chatId, text, opts).catch(() => {}));
+    const fail = (error) => {
+      // 排队消息发送失败不能静默丢弃：写入聊天并通知手机，方便用户重发。
+      const c = this.store.get(chatId);
+      if (c) {
+        this.store.pushItem(c, { k: 'err', ts: Date.now(), t: '排队消息发送失败：' + error + '\n原文：' + truncate(text, 200) }, true);
+        this.store.emit('chat_update', this.store.summary(c));
+      }
+      this.emit('notify', { chatId, level: 'error', title: '排队消息未发送', body: truncate(String(error || ''), 80) });
+    };
+    setImmediate(() => this.sendMsg(chatId, text, opts).then(r => { if (r && r.ok === false) fail(r.error || '未知错误'); }).catch(e => fail(e.message)));
+  }
+
+  cancelPending(chatId, reason) {
+    const chat = this.store.get(chatId);
+    if (!chat || !chat.pendingMsgs || !chat.pendingMsgs.length) return;
+    const texts = chat.pendingMsgs.map(e => typeof e === 'string' ? e : e.text);
+    chat.pendingMsgs = [];
+    this.store.pushItem(chat, { k: 'sys', ts: Date.now(), t: reason + '，已取消 ' + texts.length + ' 条排队消息：' + texts.map(t => truncate(t, 40)).join(' / ') }, true);
+    this.store.emit('chat_update', this.store.summary(chat));
   }
 
   queueMessage(chatId, text) {
@@ -226,18 +260,22 @@ class Runner extends EventEmitter {
       let child;
       try { child = this.spawnCodex(['queue', '--thread', chatId, '--message', text], { env: process.env }); }
       catch (e) { return resolve({ ok: false, error: 'queue 启动失败: ' + e.message }); }
-      let out = '', err = '';
-      const t = setTimeout(() => { try { child.kill(); } catch {} resolve({ ok: false, error: 'queue 超时' }); }, 20e3);
-      child.stdout.on('data', d => out += d);
-      child.stderr.on('data', d => err += d);
+      let out = '', err = '', settled = false;
+      const finish = (r) => { if (!settled) { settled = true; clearTimeout(t); resolve(r); } };
+      const t = setTimeout(() => { try { child.kill(); } catch {} finish({ ok: false, error: 'queue 超时' }); }, 20e3);
+      child.stdout.on('data', d => { out = (out + d).slice(-4000); });
+      child.stderr.on('data', d => { err = (err + d).slice(-4000); });
+      // 没有 error 监听时，启动失败会抛出未捕获异常且 Promise 永不结束。
+      child.on('error', e => finish({ ok: false, error: 'queue 启动失败: ' + e.message }));
       child.on('exit', (code) => {
+        if (settled) return;
         clearTimeout(t);
         const chat = this.store.get(chatId);
         if (code === 0) {
           if (chat) this.store.pushItem(chat, { k: 'sys', ts: Date.now(), t: '已加入会话队列: ' + truncate(text, 40) }, true);
-          resolve({ ok: true, mode: 'queue' });
+          finish({ ok: true, mode: 'queue' });
         } else {
-          resolve({ ok: false, error: '无法注入运行中的会话(exit ' + code + '): ' + truncate((err || out).slice(-200), 150) + '。可等任务结束后再发。' });
+          finish({ ok: false, error: '无法注入运行中的会话(exit ' + code + '): ' + truncate((err || out).slice(-200), 150) + '。可等任务结束后再发。' });
         }
       });
     });
@@ -251,12 +289,16 @@ class Runner extends EventEmitter {
     const pid = chat.spawn ? chat.spawn.pid : (rec ? rec.child.pid : null);
     if (!pid) return { ok: false, error: '该会话不是本守护进程发起的,无法远程停止(可在电脑上手动结束)' };
     try {
-      if (IS_WIN) spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true });
-      else process.kill(-pid, 'SIGKILL') || process.kill(pid, 'SIGKILL');
+      if (IS_WIN) spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }).on('error', () => {});
+      else {
+        // 子进程以独立进程组启动时可整组结束；否则退回只结束该进程。
+        try { process.kill(-pid, 'SIGTERM'); } catch { process.kill(pid, 'SIGTERM'); }
+      }
     } catch (e) { return { ok: false, error: '停止失败: ' + e.message }; }
     chat.status = 'stopped';
     chat.runningSince = null;
     this.store.pushItem(chat, { k: 'sys', ts: Date.now(), t: '已远程停止' }, true);
+    this.cancelPending(chatId, '任务已远程停止');
     this.store.emit('chat_update', this.store.summary(chat));
     this.emit('notify', { chatId, level: 'warn', title: this.store.summary(chat).title, body: '任务已远程停止' });
     return { ok: true };

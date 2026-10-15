@@ -89,7 +89,8 @@ App 依赖前台常驻连接收通知(和微信同思路,无需谷歌服务)。�
 - **App 打开闪退?** 新版已加固(前台服务三级降级+全局异常捕获)。若仍闪退:手机连电脑后 `adb pull /data/data/top.jingxixi.codexWatch/files/crash-log.txt` 把日志发回来即可精确定位。
 - **电脑要一直开机**:Bridge 跑在电脑上,电脑睡眠=断连。请在电源设置里把睡眠改为"从不"(接电源时),或至少任务跑着时别睡眠。
 - **任务发起后没反应?** 电脑需在线(设备页有绿点);确认电脑上 `codex --version` 可用;查 `start-bridge.bat` 前台日志。
-- **忘记 admin 密码**:在 al 上执行 `node /root/codexwatch/relay/reset-password.js admin 新密码` 即可重置。
+- **忘记 admin 密码**:在 al 上执行 `node /root/codexwatch/relay/reset-password.js admin 新密码` 即可重置。新密码至少 8 位；中继运行中也可执行，约 5 秒内生效，并会让该账号所有已登录设备下线。
+- **测试**:`cd bridge && npm test` 运行离线单元/浏览器测试（浏览器用例需 Playwright，可用 `CW_PLAYWRIGHT`、`CW_BROWSER` 指定）；`npm run test:live` 需要真实 Windows 桥接、Codex 和线上中继。
 - **电脑换了网络/重启**:Bridge 自动重连云端,无需干预。
 - **多台电脑**:每台电脑放一份 `bridge/` 目录,各自 `--pair` 配对即可,App 里切换查看。
 

@@ -11,6 +11,7 @@ const { log, logErr, truncate, relTime } = require('./util');
 const MAX_ITEMS = 2500;          // 单聊天保留的 item 上限(更早的折叠)
 const QUICK_HEAD = 96 * 1024;    // 启动扫描读取文件头
 const QUICK_TAIL = 64 * 1024;    // 启动扫描读取文件尾
+const MAX_FIRST_LINE = 8 * 1024 * 1024; // session_meta 首行读取上限
 
 function basename(p) {
   if (!p) return '';
@@ -45,18 +46,36 @@ class ChatStore extends EventEmitter {
   listFiles() {
     const out = [];
     const cutoff = Date.now() - this.opts.retainDays * 864e5;
-    const walk = (d) => {
+    // sessions/YYYY/MM/DD 目录按日期剪枝：保留期之外的整年/整月/整天目录不再逐个 stat。
+    // 留 1 天余量，避免时区差异把边界当天剪掉；非日期命名的目录照常遍历。
+    const cutoffDay = new Date(cutoff - 864e5);
+    const cutKey = [cutoffDay.getFullYear(), cutoffDay.getMonth() + 1, cutoffDay.getDate()];
+    const tooOld = (parts) => {
+      for (let i = 0; i < parts.length; i++) {
+        if (parts[i] < cutKey[i]) return true;
+        if (parts[i] > cutKey[i]) return false;
+      }
+      return false;
+    };
+    const walk = (d, dateParts) => {
       let ents;
       try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
       for (const e of ents) {
         const p = path.join(d, e.name);
-        if (e.isDirectory()) walk(p);
+        if (e.isDirectory()) {
+          const width = [4, 2, 2][dateParts.length];
+          if (width && e.name.length === width && /^\d+$/.test(e.name)) {
+            const parts = dateParts.concat(Number(e.name));
+            if (tooOld(parts)) continue;
+            walk(p, parts);
+          } else walk(p, []);
+        }
         else if (e.name.endsWith('.jsonl')) {
           try { const st = fs.statSync(p); if (st.mtimeMs >= cutoff) out.push({ p, size: st.size, mtime: st.mtimeMs }); } catch {}
         }
       }
     };
-    walk(this.root);
+    walk(this.root, []);
     return out;
   }
 
@@ -67,7 +86,7 @@ class ChatStore extends EventEmitter {
     for (const f of files) {
       try {
         const info = this.quickReadFile(f.p);
-        if (!info) continue;
+        if (!info || info.pending) continue;
         if (info.meta.subagent) { skippedSub++; this.fileChat.set(f.p, null); this.filePos.set(f.p, f.size); continue; }
         this.mergeFile(f.p, info, f.size, f.mtime);
       } catch (e) { logErr('quickScan', f.p, e.message); }
@@ -75,11 +94,24 @@ class ChatStore extends EventEmitter {
     log(`[store] quick scan: ${this.chats.size} chats / ${files.length} files (子代理隐藏 ${skippedSub})`);
   }
 
+  // 返回 null = 确定不是会话文件；返回 { pending: true } = 首行尚未写完，下次轮询再识别。
   quickReadFile(file) {
     const fd = fs.openSync(file, 'r');
     try {
-      const head = Buffer.alloc(Math.min(QUICK_HEAD, fs.fstatSync(fd).size));
+      const st = fs.fstatSync(fd);
+      let head = Buffer.alloc(Math.min(QUICK_HEAD, st.size));
       fs.readSync(fd, head, 0, head.length, 0);
+      // 新版 session_meta 含完整 base_instructions，首行可能超过 96KB：继续读到首个换行（上限 8MB）。
+      let nl = head.indexOf(10);
+      while (nl < 0 && head.length < st.size && head.length < MAX_FIRST_LINE) {
+        const more = Buffer.alloc(Math.min(st.size - head.length, QUICK_HEAD * 4));
+        const n = fs.readSync(fd, more, 0, more.length, head.length);
+        if (!n) break;
+        head = Buffer.concat([head, more.subarray(0, n)]);
+        nl = head.indexOf(10);
+      }
+      // 首行还没写完（Codex 刚创建文件）：不能把文件永久判为"非会话"。
+      if (nl < 0) return head.length >= MAX_FIRST_LINE ? null : { pending: true };
       const headLines = head.toString('utf8').split('\n');
       const first = parseLine(headLines[0]);
       if (!first || first.type !== 'session_meta') return null;
@@ -91,13 +123,13 @@ class ChatStore extends EventEmitter {
       for (let i = 1; i < headLines.length && !firstUser; i++) {
         const rec = parseLine(headLines[i]);
         if (!rec || rec.type !== 'response_item' || !rec.payload || rec.payload.type !== 'message' || rec.payload.role !== 'user') continue;
-        const t = cleanUserText(require('./rollout').translate(rec)?.item?.t || '');
+        const t = cleanUserText(translate(rec)?.item?.t || '');
         if (t && t.length > 1) firstUser = t;
       }
       if (/^The following is the Codex agent history/i.test(firstUser)) return { meta: Object.assign({}, meta, { subagent: true }) };
 
       // 读尾部推状态
-      const size = fs.fstatSync(fd).size;
+      const size = st.size;
       const tailLen = Math.min(QUICK_TAIL, size);
       const tail = Buffer.alloc(tailLen);
       fs.readSync(fd, tail, 0, tailLen, size - tailLen);
@@ -105,7 +137,9 @@ class ChatStore extends EventEmitter {
       if (tailLen < size && tailLines.length) tailLines = tailLines.slice(1); // 丢弃半行
       let status = 'idle', lastMsg = '', lastTs = meta.ts, tokens = null, lastError = '', lastDurMs = null, model = '', effort = '', approvalPolicy = '', sandbox = null;
       // 尾部可能全是工具输出；先取头部状态，避免漏掉任务开始后默认成空闲。
-      for (const l of [...headLines, ...tailLines]) {
+      // 小文件头尾重叠时只扫描一次，避免同一事件重复计算。
+      const scanLines = size <= head.length ? headLines : headLines.concat(tailLines);
+      for (const l of scanLines) {
         const rec = parseLine(l);
         if (!rec) continue;
         const tr = translate(rec);
@@ -250,9 +284,14 @@ class ChatStore extends EventEmitter {
     if (knownChatId) chat = this.chats.get(knownChatId);
     if (!chat) {
       // 新文件:先读头部识别
-      const info = this.quickReadFile(file);
-      if (!info) { this.fileChat.set(file, null); this.filePos.set(file, fs.statSync(file).size); return; }
-      if (info.meta.subagent) { this.fileChat.set(file, null); this.filePos.set(file, fs.statSync(file).size); return; }
+      let info;
+      try { info = this.quickReadFile(file); } catch { return; }
+      if (info && info.pending) return; // 首行未写完，下次再读
+      if (!info || info.meta.subagent) {
+        this.fileChat.set(file, null);
+        try { this.filePos.set(file, fs.statSync(file).size); } catch {}
+        return;
+      }
       this.mergeFile(file, info, 0, Date.now());
       chat = this.chats.get(info.meta.chatKey);
       pos = 0;
@@ -278,7 +317,7 @@ class ChatStore extends EventEmitter {
       }
       this.filePos.set(file, pos + consumed);
       chat.lastFileTs = Date.now();
-      if (chat._stale || true) this.emit('chat_update', this.summary(chat));
+      this.emit('chat_update', this.summary(chat));
     } catch (e) {
       logErr('tailFile', file, e.message);
     } finally { try { fs.closeSync(fd); } catch {} }
@@ -332,8 +371,13 @@ class ChatStore extends EventEmitter {
     if (tr.itemOut) {
       const items = chat.items;
       if (items) {
-        for (let i = items.length - 1; i >= 0; i--) {
-          if (items[i].k === 'tool' && items[i].callId === tr.itemOut.callId) { items[i].out = tr.itemOut.out; break; }
+        // 只回看最近 200 条：工具输出总是紧跟调用，避免长聊天每行全量扫描。
+        for (let i = items.length - 1; i >= 0 && i >= items.length - 200; i--) {
+          if (items[i].k === 'tool' && items[i].callId === tr.itemOut.callId) {
+            items[i].out = tr.itemOut.out;
+            if (!chat._replaying) this.emit('item_refresh', chat.id, items[i]);
+            break;
+          }
         }
       }
       return;
@@ -365,14 +409,14 @@ class ChatStore extends EventEmitter {
       else if (done.lastAgentMessage) chat.lastMsg = done.lastAgentMessage;
       const sec = done.durationMs != null ? Math.round(done.durationMs / 1000) + 's' : '';
       this.pushItem(chat, { k: 'sys', ts, t: '任务完成' + (sec ? ' · 用时 ' + sec : ''), done: true }, true);
-      if (!chat._replaying) this.emit('notify', { chatId: chat.id, level: 'done', title: this.summary(chat).title, body: truncate(done.lastAgentMessage || '任务已完成', 90) });
+      if (!chat._replaying) this.emit('notify', { chatId: chat.id, level: 'done', turnId: done.turnId || chat.turnId || null, title: this.summary(chat).title, body: truncate(done.lastAgentMessage || '任务已完成', 90) });
       return;
     }
     if (tr.status === 'stopped') {
       chat.status = 'stopped';
       chat.runningSince = null;
       this.pushItem(chat, { k: 'sys', ts, t: '已中断' + (tr.reason ? '(' + tr.reason + ')' : '') }, true);
-      if (!chat._replaying) this.emit('notify', { chatId: chat.id, level: 'warn', title: this.summary(chat).title, body: '任务被中断' });
+      if (!chat._replaying) this.emit('notify', { chatId: chat.id, level: 'warn', turnId: chat.turnId ? chat.turnId + ':stop' : null, title: this.summary(chat).title, body: '任务被中断' });
       return;
     }
     if (tr.status === 'error') {
@@ -381,7 +425,7 @@ class ChatStore extends EventEmitter {
       chat.lastError = tr.message;
       chat.lastMsg = '出错: ' + tr.message;
       this.pushItem(chat, { k: 'err', ts, t: tr.message.slice(0, 1500) }, true);
-      if (!chat._replaying) this.emit('notify', { chatId: chat.id, level: 'error', title: this.summary(chat).title, body: truncate('任务出错: ' + tr.message, 90) });
+      if (!chat._replaying) this.emit('notify', { chatId: chat.id, level: 'error', turnId: chat.turnId ? chat.turnId + ':err' : null, title: this.summary(chat).title, body: truncate('任务出错: ' + tr.message, 90) });
       return;
     }
     if (tr.tokens) {

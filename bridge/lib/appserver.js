@@ -54,6 +54,9 @@ function threadItemToUi(item) {
   }
 }
 
+const APPROVAL_DECISIONS = ['accept', 'acceptForSession', 'decline', 'cancel'];
+const LEGACY_DECISION = { accept: 'approved', acceptForSession: 'approved_for_session', decline: 'denied', cancel: 'abort' };
+
 class AppServerLink extends EventEmitter {
   constructor(codexJsPath, opts) {
     super();
@@ -98,6 +101,9 @@ class AppServerLink extends EventEmitter {
       child = spawn(process.execPath, [this.codexJs, 'app-server'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     } catch (e) { logErr('[as] 启动失败', e.message); return; }
     this.child = child;
+    // 进程异常退出后写 stdin 会触发 EPIPE；不加监听会变成未捕获异常。
+    child.stdin.on('error', () => {});
+    child.on('error', (e) => logErr('[as] 进程错误', e.message));
     child.stdout.setEncoding('utf8');
     this.buf = '';
     child.stdout.on('data', d => { if (this.child === child) this.onStdout(d); });
@@ -110,12 +116,38 @@ class AppServerLink extends EventEmitter {
       this.available = false;
       for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('电脑模型服务正在重连，请稍后重试')); }
       this.pending.clear();
+      this.recoverChatsAfterExit();
       this.emit('down');
       const wait = Math.min(5000 * ++this.retry, 60000);
       logErr('[as] 进程退出 code=' + code, errTail.slice(-120).replace(/\n/g, ' '));
       setTimeout(() => this.start(), wait);
     });
     this.handshake();
+  }
+
+  // app-server 重启后旧进程里的线程、轮次和待答请求全部失效：
+  // 结束卡住的"运行中"状态、作废授权/提问卡片，并在下一条消息前 thread/resume 重新载入线程。
+  recoverChatsAfterExit() {
+    for (const [key, rec] of this.openRequests) {
+      const chat = this.chats.get(rec.chatId);
+      const item = chat && chat.items.find(x => x.iid === rec.itemId);
+      if (item && item.decision == null && item.answers == null) { item.decision = 'expired'; this.emit('item_refresh', chat.id, item); }
+      this.openRequests.delete(key);
+    }
+    for (const chat of this.chats.values()) {
+      chat.needsResume = true;
+      chat.starting = false;
+      if (chat.compacting) chat.compacting = false;
+      if (chat.turnId || ['running', 'waiting_approval', 'waiting_input'].includes(chat.status)) {
+        chat.turnId = null;
+        chat.runningSince = null;
+        chat.status = 'interrupted';
+        chat.lastMsg = '交互服务已重启，本轮已中断';
+        this.sys(chat, '电脑交互服务已重启，本轮任务已中断；再发一条消息即可在原会话继续');
+        this.emit('notify', { chatId: chat.id, level: 'warn', title: this.summary(chat).title, body: '交互服务已重启，本轮任务已中断' });
+        this.emit('chat_update', this.summary(chat));
+      }
+    }
   }
 
   onStdout(d) {
@@ -161,6 +193,7 @@ class AppServerLink extends EventEmitter {
     });
   }
 
+  // JSON-RPC id 可以是数字或字符串：按原始值回复，不能一律 Number()。
   respond(reqId, result) {
     try { this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: reqId, result }) + '\n'); } catch {}
   }
@@ -294,6 +327,13 @@ class AppServerLink extends EventEmitter {
       this.sys(chat, '已加入队列，当前任务结束后自动发送');
       return { queued: true };
     }
+    if (chat && chat.needsResume) {
+      if (!this.available) throw new Error('电脑交互服务正在重启，请稍后重试');
+      chat.starting = true;
+      try { await this.send('thread/resume', { threadId }, 20000); chat.needsResume = false; }
+      catch (e) { throw new Error('交互会话恢复失败：' + e.message); }
+      finally { chat.starting = false; }
+    }
     const params = {
       threadId,
       input: [{ type: 'text', text: attachmentPrompt(text, attachments) }, ...attachments.filter(f => f.image).map(f => ({ type: 'localImage', path: f.path }))],
@@ -338,11 +378,7 @@ class AppServerLink extends EventEmitter {
     }
     const chat = threadId ? this.chats.get(threadId) : null;
     if (!chat) {
-      if (/^(turn|item)\//.test(m)) log('[as] 未匹配通知丢弃:', m.method, 'tid=' + String(threadId).slice(0, 8), 'chats=' + this.chats.size);
-      if (m === 'thread/name/updated' && p.threadId && p.name) {
-        const c = this.chats.get(p.threadId);
-        if (c) { c.title = p.name; this.emit('chat_update', this.summary(c)); }
-      }
+      if (/^(turn|item)\//.test(m)) log('[as] 未匹配通知丢弃:', m, 'tid=' + String(threadId).slice(0, 8), 'chats=' + this.chats.size);
       return;
     }
     switch (m) {
@@ -375,9 +411,9 @@ class AppServerLink extends EventEmitter {
         break;
       }
       case 'item/agentMessage/delta': {
-        // 流式:直接追加到尾部 agent 气泡
-        const last = chat.items[chat.items.length - 1];
-        if (last && last.k === 'agent' && last.iid === p.itemId) {
+        // 流式:追加到同一 itemId 的 agent 气泡（中间可能插入思考/工具条目，只回看最近几条）
+        const last = this.recentItem(chat, p.itemId, 'agent');
+        if (last) {
           last.t += String(p.delta || '');
           if (last.t.length > 6000) last.t = last.t.slice(0, 6000);
           chat.lastMsg = last.t;
@@ -390,8 +426,8 @@ class AppServerLink extends EventEmitter {
         break;
       }
       case 'item/reasoning/summaryTextDelta': {
-        const last = chat.items[chat.items.length - 1];
-        if (last && last.k === 'reason' && last.iid === p.itemId) {
+        const last = this.recentItem(chat, p.itemId, 'reason');
+        if (last) {
           last.t += String(p.delta || '');
           this.emit('item_refresh', chat.id, last);
         } else if (p.delta) {
@@ -406,19 +442,29 @@ class AppServerLink extends EventEmitter {
       }
       case 'turn/completed': {
         if(chat.compacting){chat.compacting=false;this.sys(chat,'压缩流程已结束，未收到压缩完成确认');}
+        // v2 协议把结果放在 turn.status（completed / interrupted / failed），旧版用 reason。
+        const turnStatus = String((p.turn && p.turn.status) || p.status || '');
         const reason = String(p.reason || '');
+        const turnId = (p.turn && p.turn.id) || p.turnId || chat.turnId || '';
         chat.turnId = null;
         chat.runningSince = null;
-        if (/interrupt/i.test(reason)) {
+        this.expireRequests(chat.id);
+        if (/interrupt/i.test(turnStatus) || /interrupt/i.test(reason)) {
           chat.status = 'stopped';
           this.sys(chat, '已中断');
-          this.emit('notify', { chatId: chat.id, level: 'warn', title: this.summary(chat).title, body: '任务已中断' });
+          this.emit('notify', { chatId: chat.id, level: 'warn', itemId: turnId + ':stop', title: this.summary(chat).title, body: '任务已中断' });
+        } else if (/fail/i.test(turnStatus)) {
+          const message = String((p.turn && p.turn.error && p.turn.error.message) || '任务执行失败');
+          chat.status = 'error';
+          chat.lastMsg = '出错: ' + message;
+          this.pushItem(chat, { k: 'err', ts: Date.now(), t: message.slice(0, 800) });
+          this.emit('notify', { chatId: chat.id, level: 'error', itemId: turnId + ':err', title: this.summary(chat).title, body: '任务出错: ' + message.slice(0, 80) });
         } else {
           chat.status = 'idle';
           const usage = p.usage || {};
           if (usage.inputTokens != null) chat.tokens = { in: usage.inputTokens, out: usage.outputTokens, total: (usage.inputTokens || 0) + (usage.outputTokens || 0) };
           this.sys(chat, '任务完成', { done: true });
-          this.emit('notify', { chatId: chat.id, level: 'done', title: this.summary(chat).title, body: this.summary(chat).lastMsg || '任务已完成' });
+          this.emit('notify', { chatId: chat.id, level: 'done', itemId: turnId || null, title: this.summary(chat).title, body: this.summary(chat).lastMsg || '任务已完成' });
         }
         this.emit('chat_update', this.summary(chat));
         this.emit('turn_done', chat.id);
@@ -438,11 +484,14 @@ class AppServerLink extends EventEmitter {
         break;
       }
       case 'error': {
+        // v2: { error: { message }, willRetry }；willRetry=true 是可自动恢复的临时错误（如限流重试），不能把任务标成失败。
+        const message = String((p.error && p.error.message) || p.message || '未知错误');
+        if (p.willRetry) { this.sys(chat, '临时错误，Codex 正在自动重试：' + message.slice(0, 200)); break; }
         chat.compacting=false;
         chat.status = 'error';
         chat.runningSince = null;
-        this.pushItem(chat, { k: 'err', ts: Date.now(), t: String(p.message || '未知错误').slice(0, 800) });
-        this.emit('notify', { chatId: chat.id, level: 'error', title: this.summary(chat).title, body: '任务出错: ' + String(p.message || '').slice(0, 80) });
+        this.pushItem(chat, { k: 'err', ts: Date.now(), t: message.slice(0, 800) });
+        this.emit('notify', { chatId: chat.id, level: 'error', title: this.summary(chat).title, body: '任务出错: ' + message.slice(0, 80) });
         this.emit('chat_update', this.summary(chat));
         break;
       }
@@ -463,13 +512,13 @@ class AppServerLink extends EventEmitter {
         title: m === 'item/fileChange/requestApproval' ? '文件修改授权' : '命令授权',
         command: String(command).slice(0, 1200), cwd: p.cwd || (chat && chat.cwd) || '',
       };
-      this.openRequests.set(String(msg.id), { method: m, params: p, chatId: threadId, itemId: item.iid, kind: 'approval' });
+      this.openRequests.set(String(msg.id), { method: m, params: p, chatId: threadId, itemId: item.iid, kind: 'approval', rawId: msg.id });
       if (chat) {
         this.pushItem(chat, item);
         chat.status = 'waiting_approval';
         this.emit('chat_update', this.summary(chat));
         this.emit('notify', {
-          chatId: chat.id, level: 'ask', title: '需要你的授权',
+          chatId: chat.id, level: 'ask', itemId: item.iid, title: '需要你的授权',
           body: String(command).slice(0, 80) || 'Codex 请求执行操作',
         });
       }
@@ -485,13 +534,13 @@ class AppServerLink extends EventEmitter {
         k: 'askuser', ts: Date.now(), iid: 'ask-' + (p.itemId || msg.id), reqId: String(msg.id),
         blocking: !!p.isBlocking, questions,
       };
-      this.openRequests.set(String(msg.id), { method: m, params: p, chatId: threadId, itemId: item.iid, kind: 'askuser' });
+      this.openRequests.set(String(msg.id), { method: m, params: p, chatId: threadId, itemId: item.iid, kind: 'askuser', rawId: msg.id });
       if (chat) {
         this.pushItem(chat, item);
         chat.status = 'waiting_input';
         this.emit('chat_update', this.summary(chat));
         this.emit('notify', {
-          chatId: chat.id, level: 'ask', title: 'Codex 在等你回答',
+          chatId: chat.id, level: 'ask', itemId: item.iid, title: 'Codex 在等你回答',
           body: (questions[0] && questions[0].question || '').slice(0, 80) || '点击进入回答',
         });
       }
@@ -506,6 +555,8 @@ class AppServerLink extends EventEmitter {
   answerApproval(key, decision) {
     const rec = this.openRequests.get(key);
     if (!rec) return { ok: false, error: '该请求已失效(可能已处理或超时)' };
+    if (rec.kind && rec.kind !== 'approval') return { ok: false, error: '该请求不是授权请求' };
+    if (!APPROVAL_DECISIONS.includes(decision)) return { ok: false, error: '不支持的授权决定' };
     this.openRequests.delete(key);
     const chat = this.chats.get(rec.chatId);
     if (chat) {
@@ -513,13 +564,16 @@ class AppServerLink extends EventEmitter {
       if (item) { item.decision = decision; this.emit('item_refresh', chat.id, item); }
       if (chat.status === 'waiting_approval' || chat.status === 'waiting_input') { chat.status = 'running'; this.emit('chat_update', this.summary(chat)); }
     }
-    this.respond(Number(key), { decision });
+    // 旧版 execCommandApproval/applyPatchApproval 使用 approved/denied/abort 取值。
+    const legacy = rec.method === 'execCommandApproval' || rec.method === 'applyPatchApproval';
+    this.respond(rec.rawId != null ? rec.rawId : key, { decision: legacy ? LEGACY_DECISION[decision] : decision });
     return { ok: true };
   }
 
   answerUserInput(key, answers) {
     const rec = this.openRequests.get(key);
     if (!rec) return { ok: false, error: '该提问已失效' };
+    if (rec.kind && rec.kind !== 'askuser') return { ok: false, error: '该请求不是提问' };
     const questions = rec.params.questions || [];
     if (!Array.isArray(answers) || answers.length!==questions.length || answers.some(a=>typeof a!=='string'||!a.trim())) return {ok:false,error:'请回答全部问题'};
     this.openRequests.delete(key);
@@ -534,8 +588,28 @@ class AppServerLink extends EventEmitter {
       }
       if (chat.status === 'waiting_input') { chat.status = 'running'; this.emit('chat_update', this.summary(chat)); }
     }
-    this.respond(Number(key), { answers: Object.fromEntries(questions.map((q,i)=>[q.id,{answers:[answers[i]]}])) });
+    this.respond(rec.rawId != null ? rec.rawId : key, { answers: Object.fromEntries(questions.map((q,i)=>[q.id,{answers:[answers[i]]}])) });
     return { ok: true };
+  }
+
+  recentItem(chat, iid, kind) {
+    if (!iid) return null;
+    for (let i = chat.items.length - 1; i >= 0 && i >= chat.items.length - 30; i--) {
+      const x = chat.items[i];
+      if (x.iid === iid && x.k === kind) return x;
+    }
+    return null;
+  }
+
+  // 轮次结束后仍挂着的授权/提问已无意义，标记失效，避免手机上还能点。
+  expireRequests(chatId) {
+    for (const [key, rec] of this.openRequests) {
+      if (rec.chatId !== chatId) continue;
+      this.openRequests.delete(key);
+      const chat = this.chats.get(chatId);
+      const item = chat && chat.items.find(x => x.iid === rec.itemId);
+      if (item && item.decision == null && item.answers == null) { item.decision = 'expired'; this.emit('item_refresh', chatId, item); }
+    }
   }
 
   itemsView(chatId) {

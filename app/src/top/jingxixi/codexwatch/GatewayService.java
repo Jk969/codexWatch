@@ -20,6 +20,7 @@ import android.os.Looper;
 
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -312,6 +313,35 @@ public class GatewayService extends Service {
         }
     }
 
+    /** 网页端设置的免打扰聊天，键为 deviceId/chatId；原生通知需要据此跳过。 */
+    public static void writeMutedChats(Context ctx, String json) {
+        try {
+            JSONArray in = new JSONArray(json);
+            JSONArray out = new JSONArray();
+            for (int i = 0; i < in.length() && i < 2000; i++) {
+                String k = in.optString(i, "");
+                if (k.length() > 0 && k.length() < 300) out.put(k);
+            }
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("muted", out.toString()).apply();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    static boolean isChatMuted(Context ctx, String deviceId, String chatId) {
+        if (chatId == null || chatId.length() == 0) return false;
+        try {
+            JSONArray arr = new JSONArray(ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("muted", "[]"));
+            String suffix = "/" + chatId;
+            for (int i = 0; i < arr.length(); i++) {
+                String k = arr.optString(i, "");
+                // 旧中继补发的离线通知没有 deviceId，只能按聊天 ID 匹配。
+                if (deviceId != null && deviceId.length() > 0 ? k.equals(deviceId + suffix) : k.endsWith(suffix)) return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
     // ================= WebView 挂接/回调 =================
 
     static void dispatchJs(String expr) {
@@ -540,6 +570,7 @@ public class GatewayService extends Service {
                     String title = d.optString("title");
                     String body = d.has("body") ? d.optString("body") : "";
                     String chatId = d.has("chatId") ? d.optString("chatId") : null;
+                    if (isChatMuted(this, d.optString("deviceId", ""), chatId)) return;
                     String eventId = d.optString("nid", "");
                     int nid = eventId.length() == 0 ? 0 : ((d.optString("deviceId", "") + ":" + eventId).hashCode() & 0x7fffffff);
                     if (nid == NID_SERVICE) nid++;

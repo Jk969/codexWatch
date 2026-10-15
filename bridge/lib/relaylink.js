@@ -102,7 +102,15 @@ class RelayLink {
     ws.on('message', (data) => {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (msg.t === 'frame' && msg.d) this.hub.handleFrame(msg.d, this.sink || { send: () => {}, label: 'relay-null' });
+      if (msg.t === 'frame' && msg.d) {
+        // 新版中继会带上请求方连接编号 from：回执只发给发起请求的那台手机，
+        // 不再把文件内容、目录列表、全量状态等广播给所有已配对用户。旧中继没有 from 时保持广播。
+        const from = typeof msg.from === 'string' && msg.from.length <= 64 ? msg.from : null;
+        const reply = from
+          ? { send: (frame) => { if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'frame', d: frame, to: from })); }, label: 'relay:' + from }
+          : (this.sink || { send: () => {}, label: 'relay-null' });
+        this.hub.handleFrame(msg.d, reply);
+      }
       else if (msg.t === 'ping') ws.send(JSON.stringify({ t: 'pong' }));
     });
 

@@ -34,6 +34,7 @@ async function workspacePath(root,requested){
 }
 async function browseWorkspace(root,requested){
   const {base,target}=await workspacePath(root,requested);
+  if(!(await fs.stat(target)).isDirectory())throw Error('这不是文件夹');
   const entries=await fs.readdir(target,{withFileTypes:true});
   const visible=entries.filter(e=>e.isFile()||e.isDirectory()).sort((a,b)=>Number(b.isDirectory())-Number(a.isDirectory())||a.name.localeCompare(b.name,'zh-CN'));
   return {path:target,parent:target===base?null:path.dirname(target),entries:visible.slice(0,1000).map(e=>({name:e.name,path:path.join(target,e.name),directory:e.isDirectory()})),truncated:visible.length>1000};
