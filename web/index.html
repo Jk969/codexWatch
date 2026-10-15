@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#EDEDED">
+<title>CodexWatch</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <!-- 登录页(仅远程模式) -->
+  <div id="login" class="page">
+    <div class="login-hero">
+      <div class="login-logo" id="login-logo"></div>
+      <div class="login-title">CodexWatch</div>
+      <div class="login-sub">手机上的 Codex 任务指挥台</div>
+    </div>
+    <div class="login-form" id="login-form">
+      <div class="login-field"><input id="li-name" placeholder="账号" autocomplete="username"></div>
+      <div class="login-field"><input id="li-pass" type="password" placeholder="密码" autocomplete="current-password"></div>
+      <div class="login-field hidden" id="li-invite-wrap"><input id="li-invite" placeholder="邀请码"></div>
+      <button class="btn-primary" id="li-submit">登录</button>
+      <div class="login-links"><a id="li-toggle">邀请码注册</a></div>
+      <div class="login-err" id="li-err"></div>
+    </div>
+    <div class="login-foot">仅限受邀人员使用</div>
+  </div>
+
+  <!-- 主框架 -->
+  <div id="main" class="page hidden">
+    <div id="view-chats" class="view">
+      <div class="nav">
+        <div class="nav-title">任务<span class="conn-dot" id="conn-dot"></span></div>
+        <div class="nav-right search-icon" id="btn-search">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><line x1="16.5" y1="16.5" x2="21" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </div>
+      </div>
+      <div class="search-bar hidden" id="search-bar"><input id="search-input" placeholder="搜索"></div>
+      <div class="scroll" id="chat-list"></div>
+    </div>
+
+    <div id="view-projects" class="view hidden">
+      <div class="nav"><div class="nav-title">项目</div></div>
+      <div class="scroll" id="project-list"></div>
+    </div>
+
+    <div id="view-devices" class="view hidden">
+      <div class="nav"><div class="nav-title">设备</div></div>
+      <div class="scroll" id="device-list"></div>
+    </div>
+
+    <div id="view-discover" class="view hidden">
+      <div class="nav"><div class="nav-title">动态</div></div>
+      <div class="scroll" id="discover"></div>
+    </div>
+
+    <div id="view-me" class="view hidden">
+      <div class="nav"><div class="nav-title">我</div></div>
+      <div class="scroll" id="me"></div>
+    </div>
+
+    <div class="tabbar" id="tabbar">
+      <div class="tab active" data-tab="chats">
+        <svg viewBox="0 0 28 28"><path d="M4 6.5C4 4.6 5.6 3 7.5 3h13C22.4 3 24 4.6 24 6.5v9c0 1.9-1.6 3.5-3.5 3.5H12l-5.2 4.2c-.6.5-1.8.2-1.8-.9V6.5z" fill="currentColor"/><path d="M8 8.5h12M8 12h8" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span>任务</span><i class="tab-badge hidden" id="tab-badge"></i>
+      </div>
+      <div class="tab" data-tab="projects">
+        <svg viewBox="0 0 28 28"><rect x="4" y="5" width="20" height="18" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 5V3.8A1.8 1.8 0 0 1 10.8 2h6.4A1.8 1.8 0 0 1 19 3.8V5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M4 11h20" stroke="currentColor" stroke-width="2"/></svg>
+        <span>项目</span>
+      </div>
+      <div class="tab" data-tab="devices">
+        <svg viewBox="0 0 28 28"><rect x="5" y="3" width="12" height="22" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="11" cy="22" r="1.4" fill="currentColor"/><path d="M19 8l4-2v16l-4-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        <span>设备</span>
+      </div>
+      <div class="tab" data-tab="discover">
+        <svg viewBox="0 0 28 28"><circle cx="14" cy="14" r="11" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16.5 8l-4.5 7h5l-4.5 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>动态</span>
+      </div>
+      <div class="tab" data-tab="me">
+        <svg viewBox="0 0 28 28"><circle cx="14" cy="9" r="5" fill="currentColor"/><path d="M4.5 24.5c1-5 5-7.5 9.5-7.5s8.5 2.5 9.5 7.5" fill="currentColor"/></svg>
+        <span>我</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 聊天(任务详情) -->
+  <div id="chat" class="overlay hidden">
+    <div class="nav">
+      <div class="nav-left" id="chat-back">
+        <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7" fill="none" stroke="#191919" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="nav-title-wrap"><div class="nav-title sm" id="chat-title">任务</div><div class="nav-sub" id="chat-sub"></div></div>
+      <div class="nav-right" id="chat-menu-btn">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="19" r="2" fill="currentColor"/></svg>
+      </div>
+    </div>
+    <div class="wait-banner hidden" id="wait-banner"></div>
+    <div class="chat-scroll" id="chat-scroll"><div class="chat-body" id="chat-body"></div></div>
+    <div class="inputbar" id="inputbar">
+      <div id="shutdown-bar" class="shutdown-bar hidden"></div>
+      <div class="composer-meta"><button id="chat-context" class="context-info" aria-label="查看上下文占用">上下文：暂无数据</button><button id="chat-permission" class="permission-pill" aria-label="切换审批模式">审批：读取中</button></div>
+      <div id="chat-attachments" class="attachment-strip hidden"></div>
+      <textarea id="chat-input" rows="2" placeholder="发消息给电脑上的 Codex…" aria-label="消息内容"></textarea>
+      <div class="composer-tools">
+        <button class="ib-plus" id="chat-plus" aria-label="添加图片或文件">＋</button>
+        <button class="model-pill" id="chat-tune" aria-label="选择模型"><span id="chat-model-label">默认模型</span><span>⌄</span></button>
+        <button class="effort-pill" id="chat-effort" aria-label="选择思考强度">思考：默认</button>
+        <button class="composer-shortcut" id="chat-slash" aria-label="快捷指令">/</button>
+        <button class="composer-shortcut" id="chat-mention" aria-label="引用电脑文件">@</button>
+        <button class="ib-send" id="chat-send" disabled aria-label="发送消息">↑</button>
+      </div>
+      <input type="file" id="chat-file-input" multiple hidden>
+      <input type="file" id="chat-image-input" accept="image/png,image/jpeg,image/webp" multiple hidden>
+    </div>
+  </div>
+
+  <!-- 发起任务 -->
+  <div id="newtask" class="overlay hidden">
+    <div class="nav">
+      <div class="nav-title">发起任务</div>
+      <div class="nav-right cancel" id="newtask-cancel">取消</div>
+    </div>
+    <div class="scroll form-scroll" id="newtask-body"></div>
+  </div>
+
+  <!-- 通用子面板容器(配对设备/邀请/通知设置/连接信息) -->
+  <div id="subpanel" class="overlay hidden">
+    <div class="nav">
+      <div class="nav-left" id="subpanel-back">
+        <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7" fill="none" stroke="#191919" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="nav-title" id="subpanel-title"></div>
+    </div>
+    <div class="scroll" id="subpanel-body"></div>
+  </div>
+
+  <!-- 聊天右上菜单(动作面板) -->
+  <div id="chat-menu-mask" class="mask hidden">
+    <div class="popover" id="chat-menu"></div>
+  </div>
+
+  <!-- 底部弹层(任务发起入口菜单 / ⊕面板) -->
+  <div id="sheet-mask" class="mask hidden">
+    <div class="sheet" id="sheet"></div>
+  </div>
+
+  <!-- toast -->
+  <div id="toast" class="toast hidden"></div>
+</div>
+<script src="vendor/marked.umd.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="markdown.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

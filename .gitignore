@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Local configurations & secrets (contains deviceToken / passwords)
+bridge/config.json
+*.keystore
+
+# Logs & service outputs
+*.log
+bridge/*.log
+bridge/bridge-service.*.log
+
+# Build outputs
+app/build/
+app/test/build-notification/top/
+dist/*.apk
+dist/*.zip
+
+# Large binary SDK / Tools (downloadable / local tools)
+.tools/
+*.zip
+*.dex
+*.class
+*.arsc
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.tmp

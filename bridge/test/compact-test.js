@@ -1,0 +1,22 @@
+'use strict';
+const {test}=require('node:test');const assert=require('node:assert/strict');const {EventEmitter}=require('node:events');
+const {AppServerLink}=require('../lib/appserver');const {Hub}=require('../lib/hub');
+test('压缩走原生 RPC；提交和完成分开，运行中或桌面聊天不另开 writer',async()=>{
+  const as=Object.create(AppServerLink.prototype);EventEmitter.call(as);as.available=true;
+  const chat={id:'compact',cwd:process.cwd(),status:'idle',items:[],title:'测试',turns:0};as.chats=new Map([[chat.id,chat]]);
+  const calls=[];as.send=async(method,params)=>{calls.push({method,params});return {};};
+  const store=new EventEmitter();store.get=()=>({id:'desktop',cwd:process.cwd(),status:'idle'});
+  const runner=new EventEmitter();runner.sendMsg=()=>{throw Error('不得用普通消息伪装压缩');};runner.newTask=()=>{throw Error('不得另开进程');};
+  const hub=new Hub(store,runner,as);const replies=[];
+  await hub.handleFrame({t:'compact_context',chatId:chat.id,ref:'compact-request'},{send:f=>replies.push(f)});
+  assert.equal(replies[0].ok,true);assert.deepEqual(calls,[{method:'thread/compact/start',params:{threadId:chat.id}}]);
+  assert.equal(as.summary(chat).compacting,true);assert.equal(chat.items.length,0,'RPC 回执不能当成压缩完成');
+  await assert.rejects(as.compactContext(chat.id),/等待/);
+  as.onNotification({method:'item/started',params:{threadId:chat.id,item:{id:'compact-item',type:'contextCompaction'}}});
+  as.onNotification({method:'item/completed',params:{threadId:chat.id,item:{id:'compact-item',type:'contextCompaction'}}});
+  assert.equal(chat.compacting,false);assert.equal(chat.items.at(-1).t,'上下文压缩完成');
+  chat.status='running';await assert.rejects(as.compactContext(chat.id),/等待/);
+  await hub.handleFrame({t:'compact_context',chatId:'desktop',ref:'desktop-request'},{send:f=>replies.push(f)});
+  assert.match(replies.at(-1).error,/桌面/);assert.equal(calls.length,1);
+  chat.status='idle';as.send=async()=>{throw Error('RPC失败');};await assert.rejects(as.compactContext(chat.id),/RPC失败/);assert.equal(chat.compacting,false);
+});

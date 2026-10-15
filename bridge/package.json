@@ -1,0 +1,13 @@
+{
+  "name": "codexwatch-bridge",
+  "version": "1.0.0",
+  "description": "CodexWatch PC 守护进程:监控 Codex 会话并桥接到云端中继",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "start-hidden": "node index.js --quiet"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

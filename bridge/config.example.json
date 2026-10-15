@@ -1,0 +1,6 @@
+{
+  "deviceId": "YOUR-DEVICE-ID-UUID",
+  "server": "https://your-relay-server.example.com",
+  "name": "My-PC",
+  "deviceToken": "YOUR-DEVICE-TOKEN"
+}

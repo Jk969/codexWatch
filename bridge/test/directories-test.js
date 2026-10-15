@@ -1,0 +1,114 @@
+'use strict';
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const os=require('node:os');
+const path=require('node:path');
+const {EventEmitter}=require('node:events');
+const {browseDirectories}=require('../lib/directories');
+const {Hub}=require('../lib/hub');
+const {startLocalServer}=require('../lib/localserver');
+
+test('电脑目录浏览：根入口、子目录、上级、无效目录及响应关联',async()=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'cw-directory-test-'));
+  assert.equal(path.dirname(root),path.resolve(os.tmpdir()));
+  try{
+    fs.mkdirSync(path.join(root,'中文文件夹'));fs.writeFileSync(path.join(root,'不能选的文件.txt'),'data');
+    const result=await browseDirectories(root);
+    assert.equal(result.entries.length,1);assert.equal(result.entries[0].name,'中文文件夹');
+    assert.equal(result.parent,path.dirname(result.path));
+    assert((await browseDirectories('')).entries.length>0);
+    await assert.rejects(browseDirectories('relative'),/有效/);
+    await assert.rejects(browseDirectories(path.join(root,'missing')),/不存在/);
+    await assert.rejects(browseDirectories(path.join(root,'不能选的文件.txt')),/不存在/);
+    const hub=new Hub(new EventEmitter(),new EventEmitter());let frame;
+    await hub.handleFrame({t:'browse_dirs',ref:'chosen',path:root},{send:f=>frame=f});
+    assert.equal(frame.ref,'chosen');assert.equal(frame.ok,true);assert.deepEqual(frame.entries,result.entries);
+  }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('手机新建入口与电脑文件夹选择，选择和返回保留指令及选项',async()=>{
+  const {chromium}=require(process.env.CW_PLAYWRIGHT||'playwright');
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'cw-folder-ui-'));
+  assert.equal(path.dirname(root),path.resolve(os.tmpdir()));
+  fs.mkdirSync(path.join(root,'子目录'));
+  const store=new EventEmitter(),runner=new EventEmitter(),as=new EventEmitter();
+  const chat={id:'folder-chat',title:'目录测试',cwd:root,status:'idle',lastTs:Date.now()};
+  store.summaries=()=>[chat];store.recentDirs=()=>[];store.stats=()=>({});
+  as.available=true;as.chats=new Map();as.summaries=()=>[];
+  as.itemsView=id=>({chatId:id,items:[]});
+  as.listModels=async()=>[{model:'gpt-6.1-sol',isDefault:true,supportedReasoningEfforts:[{reasoningEffort:'high'}]}];
+  let submitted,resolveSubmit;const submission=new Promise(r=>resolveSubmit=r);
+  let failSubmission=true;
+  as.startThread=async f=>{if(failSubmission)throw Error('测试创建失败');submitted=f;resolveSubmit();return {id:'created'};};
+  const hub=new Hub(store,runner,as);
+  const server=startLocalServer(hub,{port:0,webRoot:path.resolve(__dirname,'../../web')});
+  await new Promise(r=>server.once('listening',r));
+  let browser;
+  try{
+    browser=await chromium.launch({headless:true,executablePath:process.env.CW_BROWSER||undefined});
+    const page=await browser.newPage({viewport:{width:320,height:800},isMobile:true,hasTouch:true});
+    const errors=[];page.on('pageerror',e=>errors.push(e.message));
+    await page.goto('http://127.0.0.1:'+server.address().port);
+    await page.locator('.chat-item').waitFor();
+    assert.equal(await page.locator('#btn-plus').count(),0);
+    assert.equal(await page.locator('[data-tab="newtask"]').count(),0);
+    assert.equal(await page.locator('.tab').first().getAttribute('data-tab'),'chats');
+    await page.locator('[data-tab="projects"]').click();
+    await page.locator('#project-list [data-cwd]').click();
+    await page.locator('#proj-new').click();
+    assert.match(await page.locator('#chat-sub').textContent(),/草稿/);
+    assert.equal(submitted,undefined);
+    await page.locator('#chat-back').click();
+    await page.locator('#project-new').click();
+    await page.locator('#nt-choose-folder').click();
+    await page.locator('[data-folder]').first().waitFor();
+    // 从真实接口读取临时工作目录，不把手机路径冒充电脑路径。
+    await page.evaluate(p=>openFolderPicker(p),root);
+    await page.locator('[data-folder]').filter({hasText:'子目录'}).click();
+    await page.locator('#folder-use').waitFor();
+    await page.waitForTimeout(300);
+    assert.equal(await page.evaluate(()=>document.querySelector('#subpanel-body').scrollWidth<=document.querySelector('#subpanel-body').clientWidth),true);
+    await page.screenshot({path:path.resolve(__dirname,'../../dist/computer-folder-picker.png')});
+    await page.locator('#folder-use').click();
+    await page.locator('#chat').waitFor();
+    assert.equal(await page.locator('#nt-cwd').count(),0);
+    assert.match(await page.locator('#chat-sub').textContent(),/草稿/);
+    assert.equal(submitted,undefined);
+    await page.locator('#chat-input').fill('处理最新手机任务');
+    await page.locator('#chat-permission').click();
+    await page.locator('[data-approval="never"]').click();
+    await page.locator('#chat-tune').click();
+    await page.locator('[data-model="gpt-6.1-sol"]').click();
+    await page.locator('#chat-effort').click();
+    await page.locator('[data-effort="high"]').click();
+    await page.locator('#chat-menu-btn').click();await page.locator('#draft-sandbox').click();
+    await page.locator('#draft-sandbox-select').selectOption('workspace-write');
+    await page.locator('#subpanel-back').click();
+    await page.waitForTimeout(300);
+    await page.screenshot({path:path.resolve(__dirname,'../../dist/new-task-folders.png')});
+    assert.equal(await page.evaluate(()=>window.__cwback()),true);
+    await page.locator('#project-new').click();
+    await page.locator('#nt-choose-folder').click();
+    await page.evaluate(p=>openFolderPicker(p),path.join(root,'子目录'));
+    await page.locator('#folder-use').click();
+    assert.equal(await page.locator('#chat-input').inputValue(),'处理最新手机任务');
+    assert.equal(submitted,undefined);
+    await page.locator('#chat-send').click();
+    await page.waitForFunction(()=>!document.getElementById('chat-send').disabled);
+    assert.equal(submitted,undefined);
+    assert.equal(await page.locator('#chat-input').inputValue(),'处理最新手机任务');
+    failSubmission=false;
+    await page.locator('#chat-send').click();
+    await submission;
+    assert.equal(submitted.cwd,path.join(root,'子目录'));
+    assert.equal(submitted.prompt,'处理最新手机任务');assert.equal(submitted.effort,'high');
+    assert.equal(submitted.approvalPolicy,'never');
+    assert.equal(submitted.model,'gpt-6.1-sol');assert.equal(submitted.sandbox,'workspace-write');
+    await page.waitForFunction(()=>document.getElementById('chat-sub').textContent.includes('运行中'));
+    assert.deepEqual(errors,[]);
+  }finally{
+    if(browser)await browser.close();await new Promise(r=>server.close(r));
+    fs.rmSync(root,{recursive:true,force:true});
+  }
+});
