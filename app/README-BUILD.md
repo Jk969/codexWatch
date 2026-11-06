@@ -12,7 +12,7 @@ bash app/build-apk.sh
 
 产物:**`D:\dev\gpt\codexWatch\dist\codexwatch.apk`**
 
-`adb install -r dist/codexwatch.apk` 即可安装。
+`adb install -r dist/codexwatch.apk` 即可安装。覆盖安装必须使用与手机现有版本相同的签名密钥；若缺少原 `.tools/cw.keystore`，脚本会生成新密钥，新包无法覆盖旧版本。请保管好原密钥，不要提交或发送。
 
 ## 工具链(已就位,脚本自动取用)
 
@@ -53,7 +53,7 @@ bash app/build-apk.sh
 
 ## 应用基本信息
 
-- 包名 `top.jingxixi.codexwatch`,versionName `1.3.5`(versionCode 22),minSdk 24 / targetSdk 33
+- 包名 `top.jingxixi.codexwatch`,versionName `1.3.6`(versionCode 23),minSdk 24 / targetSdk 33
 - 入口 `MainActivity`:全屏 WebView 加载 `file:///android_asset/www/index.html`
 - 前台服务 `GatewayService`(dataSync):wss 长连接 + 指数退避重连(前台 2s→60s，后台 30s→300s)+ 消息/状态回调 + 任务完成本地通知；不持有 CPU 唤醒锁
 - `BootReceiver`:开机自启服务
@@ -62,7 +62,7 @@ bash app/build-apk.sh
 
 | 方法 | 说明 |
 |---|---|
-| `getVersion()` | 返回 `"1.3.5"` |
+| `getVersion()` | 返回 `"1.3.6"` |
 | `getConfig()` / `setConfig(json)` | SharedPreferences(`cw_config/cfg`)读写;缺省 `{"endpoint":"wss://pcphone.jingxixi.top/ws","token":""}`;setConfig 解析失败忽略,字段合并保存 |
 | `send(json)` | 未连接先入队(上限 100)并确保服务已启动,连接后依序发出 |
 | `isConnected()` | 当前 socket 状态 |

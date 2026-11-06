@@ -322,7 +322,7 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public String getVersion() {
-            return "1.3.5";
+            return "1.3.6";
         }
 
         @JavascriptInterface

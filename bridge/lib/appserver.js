@@ -298,6 +298,38 @@ class AppServerLink extends EventEmitter {
     catch(e){chat.compacting=false;this.emit('chat_update',this.summary(chat));throw e;}
   }
 
+  // 显式交接已关闭的外部线程，不在原进程仍写入时另起任务。
+  async adoptThread(source, unchanged) {
+    const threadId = source.id;
+    if (!this.available || this.chats.has(threadId)) throw Error('交互服务不可用或会话已接入');
+    const chat = this.newChat(threadId, source);
+    Object.assign(chat, { title: source.title || '', firstUser: source.firstUser || '',
+      createdAt: source.createdAt, lastTs: source.lastTs, lastMsg: source.lastMsg,
+      turns: source.turns, tokens: source.tokens, status: source.status,
+      items: (source.items || []).map(item => {
+        const copy = { ...item };
+        // 原进程的待答请求不能在新进程中响应。
+        if ((copy.k === 'approval' || copy.k === 'askuser') && !copy.answers && !copy.decision) copy.decision = 'expired';
+        return copy;
+      }), trimmedHead: source.trimmedHead || 0 });
+    chat.seenIds = new Set(chat.items.map(it => it.iid).filter(Boolean));
+    this.chats.set(threadId, chat); // 在 RPC 返回前占位，防止 thread/started 创建重复记录。
+    try {
+      const result = await this.send('thread/resume', { threadId }, 20000);
+      if (result?.thread?.id && result.thread.id !== threadId) throw Error('恢复的会话 ID 不匹配');
+      if (!unchanged() || chat.turnId || ['running','waiting_input','waiting_approval'].includes(chat.status)) throw Error('接入期间会话有新活动，请关闭原会话后重新检查');
+      if (result?.model) chat.model = result.model;
+      if (result?.reasoningEffort) chat.effort = result.reasoningEffort;
+      if (result?.approvalPolicy) chat.approvalPolicy = result.approvalPolicy;
+      return chat;
+    } catch (e) {
+      this.chats.delete(threadId);
+      // 恢复可能已在超时前完成；尽力解除订阅，绝不自动发送或另起进程。
+      this.send('thread/unsubscribe', { threadId }, 3000).catch(() => {});
+      throw Error('接入未确认：' + e.message + '。请检查原会话与桥接状态后再操作');
+    }
+  }
+
   async startThread({ cwd, prompt, model, effort, sandbox, approvalPolicy }) {
     const startParams = {};
     if (cwd) startParams.cwd = cwd;
@@ -615,7 +647,7 @@ class AppServerLink extends EventEmitter {
   itemsView(chatId) {
     const chat = this.chats.get(chatId);
     if (!chat) return null;
-    return { chatId, detailed: true, trimmedHead: 0, items: chat.items, summary: this.summary(chat) };
+    return { chatId, detailed: true, trimmedHead: chat.trimmedHead || 0, items: chat.items, summary: this.summary(chat) };
   }
 
   summaries() {

@@ -15,7 +15,7 @@
 2. **登录**:账号 `admin`,密码为部署时生成的强密码(2026-10-11 已轮换;忘记时在服务器执行 `node /root/codexwatch/relay/reset-password.js admin 新密码`)。
 3. **验证**:打开 App 应看到「任务」列表里全是这台电脑的历史 Codex 任务。进入 **项目 → 新建任务**，选择项目或电脑文件夹后进入聊天草稿，调整参数并发送第一条指令才会发起任务。
 
-**电脑侧无需任何操作**——守护进程已在本机运行并配置了开机自启(本机浏览器访问 http://127.0.0.1:3599 可预览同一界面)。
+**电脑侧**：双击 `start-bridge.bat` 后，桥接在后台运行；本机浏览器访问 http://127.0.0.1:3599，使用与手机相同的界面。更新代码不会自动重启已运行的旧进程。
 
 ### 🔔 通知收不到?必做的一步(国产手机)
 
@@ -46,7 +46,15 @@ App 依赖前台常驻连接收通知(和微信同思路,无需谷歌服务)。�
 | 动态 | 任务总数/运行中/累计 Token/项目分布 |
 | 我 | 账号、**邀请用户**(管理员)、通知设置、修改密码、服务器信息、退出登录 |
 
-发起的任务优先以**交互模式**运行(基于 codex app-server:可授权、可提问、可打断、可随时切模型);交互服务不可用时自动降级为 `codex exec` 一次性执行。你在终端/Codex Desktop 里自己开的会话是"外部会话":能看、能排队追加指令,但不能远程停止(无 PID 映射,属正常限制)。
+### 手机和电脑共用同一会话
+
+1. 手机和电脑都用 CodexWatch（电脑打开 http://127.0.0.1:3599）。在这里新建的交互任务，两端使用同一个 Bridge 和线程，可同步发送、审批、回答、停止和压缩上下文。
+2. 接续已有的 Codex Desktop / 终端会话：先等原任务结束并关闭该原会话；在 CodexWatch 中打开它，右上角 **⋯ → 接入统一控制 → 我已关闭原会话，接入**。这会恢复同一个线程并保留可见历史，而不是新建对话。接入后请只在两端 CodexWatch 操作该线程，不要同时在原客户端恢复它。
+3. 接入会拒绝已知运行中或有排队消息的线程，并在接入期间拒绝并发控制；但程序无法可靠证明其他 Codex 进程已经关闭，必须由你确认。原客户端有未完成的审批/提问时不能转移，需先在原客户端处理。Bridge 重启后若会话重新显示为外部会话，需要再次确认并接入。
+
+**边界**：这不是把正在运行的 Codex Desktop 原窗口无缝变成共同控制界面。未接入的外部会话仍使用现有桌面转发或 CLI 继续，不能保证远程停止、审批、压缩等功能。接入依赖所安装 Codex 的 `app-server` / `thread/resume`，不同版本可能不兼容，失败时不会自动另发消息。电脑和手机请分别更新 Bridge、网页或 APK；旧版客户端看不到新入口。
+
+方案参考：[Codex Relay 的共享 app-server 与终端接入说明](https://github.com/gronxb/codex-relay)、[Codex Mobile Bridge](https://github.com/yaoer9520/codex-mobile-bridge) 和 [Codex app-server 协议](https://developers.openai.com/codex/app-server)。这里没有直接照搬项目代码，也没有实现其远程终端模式。
 
 ## 👥 多人一起用
 
@@ -61,8 +69,10 @@ App 依赖前台常驻连接收通知(和微信同思路,无需谷歌服务)。�
 
 ## 🖥 电脑端(Bridge)管理
 
-- **已配置开机自启**(注册表 `HKCU\...\Run`,通过 `codexwatch-bridge.vbs` 静默启动)。取消:删除该注册表项或 `D:\dev\gpt\codexWatch\codexwatch-bridge.vbs`。
-- 手动前台运行(可看日志):双击 `start-bridge.bat`
+- 双击 `start-bridge.bat` 或 `codexwatch-bridge.vbs` 静默启动；需安装 Node.js，且 `node.exe` 在用户 PATH 中。已有进程占用 3599 端口时不会再启动第二份。
+- 日志：`bridge/bridge-service.stdout.log` 和 `bridge/bridge-service.stderr.log`；可能含会话信息，请勿公开。
+- 前台排错：双击 `bridge/start-debug.bat`（请先退出旧 Bridge，否则只会提示已运行）。更新后应先停止旧桥接进程，再运行新启动器；任务运行中停止 Bridge 会中断其交互任务。
+- 可将 `codexwatch-bridge.vbs` 的快捷方式放入 Windows 用户启动文件夹（Win+R → `shell:startup`）实现登录自启。移动项目后需更新快捷方式。若已有旧计划任务或注册表自启项，请检查并避免重复配置。
 - 配置文件 `bridge/config.json`(deviceId/deviceToken/server/name),**请勿泄露**——拿到它就能操作你的 Codex
 - 监控范围:近 14 天会话(`--days N` 可调);自动跳过 guardian 等内部子代理会话
 - 本机预览:http://127.0.0.1:3599
@@ -88,7 +98,7 @@ App 依赖前台常驻连接收通知(和微信同思路,无需谷歌服务)。�
 
 - **App 打开闪退?** 新版已加固(前台服务三级降级+全局异常捕获)。若仍闪退:手机连电脑后 `adb pull /data/data/top.jingxixi.codexWatch/files/crash-log.txt` 把日志发回来即可精确定位。
 - **电脑要一直开机**:Bridge 跑在电脑上,电脑睡眠=断连。请在电源设置里把睡眠改为"从不"(接电源时),或至少任务跑着时别睡眠。
-- **任务发起后没反应?** 电脑需在线(设备页有绿点);确认电脑上 `codex --version` 可用;查 `start-bridge.bat` 前台日志。
+- **任务发起后没反应?** 电脑需在线(设备页有绿点);确认电脑上 `codex --version` 可用;查看 `bridge/bridge-service.stderr.log` 或用 `bridge/start-debug.bat` 排错。
 - **忘记 admin 密码**:在 al 上执行 `node /root/codexwatch/relay/reset-password.js admin 新密码` 即可重置。新密码至少 8 位；中继运行中也可执行，约 5 秒内生效，并会让该账号所有已登录设备下线。
 - **测试**:`cd bridge && npm test` 运行离线单元/浏览器测试（浏览器用例需 Playwright，可用 `CW_PLAYWRIGHT`、`CW_BROWSER` 指定）；`npm run test:live` 需要真实 Windows 桥接、Codex 和线上中继。
 - **电脑换了网络/重启**:Bridge 自动重连云端,无需干预。

@@ -42,12 +42,12 @@
 
 | 决策点 | 选择 | 理由(含备选) |
 |---|---|---|
-| Codex 数据源 | 监听 rollout jsonl 文件 | 唯一覆盖所有来源(TUI/Desktop/exec)的统一事实源;`codex app-server` 协议为实验性、版本敏感,仅作后备增强 |
+| Codex 数据源 | 监听 rollout jsonl 文件 | 覆盖外部来源(TUI/Desktop/exec)的历史和状态；Bridge 接入的交互会话由 app-server 管理 |
 | 任务完成判定 | `event_msg.task_complete`(含 last_agent_message、duration) | 实测存在且信息完整;`turn_aborted`→已停止,`error`→出错 |
 | 会话→"聊天"归组 | 按 `session_meta.payload.session_id`(线程 id)聚合多个 rollout 文件 | resume/fork 会产生新文件但同线程;子代理(guardian 等)按 `source.subagent` 过滤隐藏 |
-| 发起新任务 | `codex exec --cd <dir> --skip-git-repo-check --json` | 用户配置 approval=never + full-access,不会卡审批;事件经 watcher 统一管道 |
-| 追加指令 | 空闲会话:`codex exec resume <id>`;运行中会话:`codex queue --thread <id> --message` | queue 走共享 daemon,可注入正在跑的交互会话 |
-| 停止任务 | 守护进程自建任务:taskkill /T /F 杀进程树;外部会话:只读+提示 | 外部进程无可靠 PID 映射 |
+| 发起新任务 | 优先 `app-server` 的 `thread/start` + `turn/start` | 支持手机与电脑共用交互界面和审批；旧版或不可用时视请求回退 exec |
+| 追加指令 | 交互线程用 `turn/start`；外部会话优先桌面转发，再按现有 CLI 路径处理 | 也可在关闭原客户端后显式接入同一线程；避免并行 writer |
+| 停止任务 | 交互线程 `turn/interrupt`；exec 任务结束进程树；外部会话提示限制 | 外部进程无可靠 PID 映射 |
 | 推送通道 | 前台服务 + WebSocket 长连接 + 本地通知 | 国内 FCM 不可达;微信/钉钉同思路;离线通知由中继暂存、重连补发 |
 | App 形态 | 原生壳(WebView + Service)+ 与 PC 同一套 Web UI | UI 100% 复用、浏览器可测;比纯 PWA 通知可靠,比纯原生快 10 倍交付 |
 | APK 构建 | JDK17 + aapt2/d8/apksigner 直构(无 Gradle) | 免 Gradle 海量依赖下载;Java 单 Activity 极简,Java-WebSocket 唯一 jar |

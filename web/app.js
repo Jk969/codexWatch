@@ -239,6 +239,12 @@ function handleFrame(d, dev){
       if (S.opened === k && !same) renderChatView(true);
       break;
     }
+    case 'chat_reset': {
+      const k = chatKey(dev, d.chatId);
+      S.loaded.delete(k); S.items.delete(k);
+      if (S.opened === k) Conn.send({t:'open_chat',chatId:d.chatId},dev);
+      break;
+    }
     case 'item': {
       const k = chatKey(dev, d.chatId);
       if (S.archived.delete(k)) persistArchived();   // 已归档任务有新动态:自动恢复到列表
@@ -617,16 +623,17 @@ function approvalHtml(it){
 }
 function askHtml(it){
   const answered = it.answers != null;
+  const expired = it.decision === 'expired';
   const desktopOnly = it.desktop && !it.async;
   const multi = (it.questions||[]).length > 1;
   const qs = (it.questions||[]).map((q,qi)=>`
     <div class="ask-q">
       ${q.header?`<div class="qh">${esc(q.header)}</div>`:''}
       <div class="qt">${esc(q.question)}</div>
-      ${!answered&&!desktopOnly&&(q.options||[]).length?`<div class="ask-opts">${q.options.map(o=>`<button class="ask-opt" data-req="${esc(it.reqId)}" data-qi="${qi}" data-label="${esc(o.label)}">${esc(o.label)}${o.description?`<span class="od">${esc(o.description)}</span>`:''}</button>`).join('')}</div>`:''}
-      ${multi&&!answered&&!desktopOnly?'<input class="ask-custom" placeholder="或输入自己的回答">':''}
+      ${!answered&&!expired&&!desktopOnly&&(q.options||[]).length?`<div class="ask-opts">${q.options.map(o=>`<button class="ask-opt" data-req="${esc(it.reqId)}" data-qi="${qi}" data-label="${esc(o.label)}">${esc(o.label)}${o.description?`<span class="od">${esc(o.description)}</span>`:''}</button>`).join('')}</div>`:''}
+      ${multi&&!answered&&!expired&&!desktopOnly?'<input class="ask-custom" placeholder="或输入自己的回答">':''}
     </div>`).join('');
-  const answerLine = answered ? `<div class="ap-done"><span class="ok">${it.submitted?'已提交回答':'已回答'}:${esc((it.answers||[]).join(' / ').slice(0,200))}</span></div>` : desktopOnly ? '<div class="ap-done">请在电脑端回答此同步提问。</div>' : `
+  const answerLine = answered ? `<div class="ap-done"><span class="ok">${it.submitted?'已提交回答':'已回答'}:${esc((it.answers||[]).join(' / ').slice(0,200))}</span></div>` : expired ? '<div class="ap-done">原会话的提问已失效</div>' : desktopOnly ? '<div class="ap-done">请在电脑端回答此同步提问。</div>' : `
     <div class="ask-free">${multi?'':`<input placeholder="输入回答,或直接点选项…" data-req="${esc(it.reqId)}">`}${multi?`<button data-sendmulti="1" data-req="${esc(it.reqId)}">提交全部回答</button>`:`<button data-send="1" data-req="${esc(it.reqId)}">发送</button>`}</div>`;
   return `<div class="msg ai" data-iid="${esc(itemKey(it))}"><div class="m-avatar"></div><div class="bubble-wrap"><div class="ask-card">
     <div class="ask-head"><span class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.4 2.3c-.8.3-.9 1-.9 1.7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="16.5" r="1" fill="currentColor"/></svg></span><span class="nm">Codex 提问${it.blocking?' · 需要回答':''}</span></div>
@@ -1580,6 +1587,7 @@ function openChatMenu(){
   if (c.status === 'running' || (S.shutdown && S.shutdown.chatId === c.id)) items.push(S.shutdown && S.shutdown.chatId === c.id
     ? {id:'shutdown', label:'🚫 取消关机计划'}
     : {id:'shutdown', label:'⏻ 任务完成后关机(延迟5分钟)'});
+  if (!c.interactive) items.push({id:'adopt', label:'🔄 接入统一控制'});
   items.push({id:'copy', label:'📋 复制会话 ID'});
   if (c.cwd) items.push({id:'files', label:'📁 浏览项目文件夹'});
   items.push({id:'info', label:'ℹ️ 任务信息'});
@@ -1592,6 +1600,14 @@ function openChatMenu(){
       $('chat-menu-mask').classList.add('hidden');
       const id = el.dataset.id;
       if (id === 'stop') Conn.send({t:'stop_task', chatId: c.id}, c._dev);
+      if (id === 'adopt') {
+        openSubpanel('接入统一控制', `<div class="usage-card"><b>在手机和电脑使用同一个聊天</b><p>先等待当前任务结束，再关闭电脑上该会话的 Codex Desktop / 终端（不是关闭 CodexWatch）。接入后请在电脑浏览器打开 http://127.0.0.1:3599 与手机共同操作。</p><p>不要同时在原 Codex 界面恢复此会话，否则可能发生写入冲突。已有原生桌面运行中的任务不能直接接管；接入后由 CodexWatch 管理的任务可在两端审批、回答和停止。</p></div><button class="model-option" id="adopt-confirm">我已关闭原会话，接入</button>`);
+        $('adopt-confirm').onclick=async()=>{
+          const button=$('adopt-confirm'); button.disabled=true;
+          try { await requestFrame({t:'adopt_chat',chatId:c.id,confirmClosed:true},c._dev); closeOverlay('subpanel'); toast('已接入统一控制'); }
+          catch(e){ toast(esc(e.message),5000); button.disabled=false; }
+        };
+      }
       if (id === 'copy') copyAnyText(c.id);
       if (id === 'info') openSubpanel('任务信息', `<div class="cells">
           <div class="cell"><div class="c-main"><div class="c-name">标题</div><div class="c-sub">${esc(c.title)}</div></div></div>

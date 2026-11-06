@@ -31,8 +31,8 @@ KS_PASS="codexwatch2024"          # keytool storepass/keypass,自签证书
 
 MIN_SDK="24"
 TARGET_SDK="33"
-VERSION_CODE="22"
-VERSION_NAME="1.3.5"
+VERSION_CODE="23"
+VERSION_NAME="1.3.6"
 
 OUT_APK="$ROOT_DIR/dist/codexwatch.apk"
 BUILD="$APP_DIR/build"            # 中间产物目录(build/ 可随时删除)

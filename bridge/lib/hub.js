@@ -14,16 +14,17 @@ class Hub {
     this.as = as || null;
     this.attachments = new Attachments();
     this.sinks = new Set(); // {send(frame), label}
+    this.transferring = new Set();
     this.shutdown = null;   // {chatId, delayMs, phase: waiting|countdown, deadline}
     this.bind();
   }
 
   bind() {
     const store = this.store;
-    store.on('chat_update', (s) => { this.broadcast({ t: 'chat_update', chat: s }); this.checkShutdownDone(s && s.id, s && s.status); });
-    store.on('item', (chatId, item) => this.broadcast({ t: 'item', chatId, item }));
-    store.on('item_refresh', (chatId, item) => this.broadcast({t:'item_refresh',chatId,item}));
-    store.on('notify', (n) => this.broadcast({ t: 'notify', d: Object.assign({ nid: n.chatId + ':' + (n.turnId || Date.now()), ts: Date.now() }, n) }));
+    store.on('chat_update', (s) => { if (s && this.as?.chats.has(s.id)) return; this.broadcast({ t: 'chat_update', chat: s }); this.checkShutdownDone(s && s.id, s && s.status); });
+    store.on('item', (chatId, item) => { if (!this.as?.chats.has(chatId)) this.broadcast({ t: 'item', chatId, item }); });
+    store.on('item_refresh', (chatId, item) => { if (!this.as?.chats.has(chatId)) this.broadcast({t:'item_refresh',chatId,item}); });
+    store.on('notify', (n) => { if (!this.as?.chats.has(n.chatId)) this.broadcast({ t: 'notify', d: Object.assign({ nid: n.chatId + ':' + (n.turnId || Date.now()), ts: Date.now() }, n) }); });
     this.runner.on('notify', (n) => this.broadcast({ t: 'notify', d: Object.assign({ nid: n.chatId + ':' + Date.now(), ts: Date.now() }, n) }));
     this.runner.on('spawn_failed', (f) => {
       this.broadcast({
@@ -60,7 +61,9 @@ class Hub {
   }
 
   stateFrame() {
-    const chats = this.store.summaries().concat(this.as ? this.as.summaries() : []);
+    const interactive = this.as ? this.as.summaries() : [];
+    const managedIds = new Set(interactive.map(c => c.id));
+    const chats = this.store.summaries().filter(c => !managedIds.has(c.id)).concat(interactive);
     chats.sort((a, b) => {
       const w = (c) => (c.status === 'running' ? 0 : (c.status === 'waiting_approval' || c.status === 'waiting_input') ? 1 : 2);
       const d = w(a) - w(b);
@@ -157,7 +160,36 @@ class Hub {
   async handleFrame(frame, sink) {
     if (!frame || typeof frame !== 'object') return;
     try {
+      if (frame.chatId && this.transferring.has(frame.chatId) && ['send_msg','stop_task','compact_context','adopt_chat','open_chat'].includes(frame.t)) throw Error('会话正在接入，请等待完成');
       switch (frame.t) {
+        case 'adopt_chat': {
+          if (frame.confirmClosed !== true) throw Error('请先关闭电脑原会话并确认');
+          if (!this.as?.available) throw Error('电脑交互服务不可用，请检查 Codex 和桥接日志');
+          if (this.as.chats.has(frame.chatId)) throw Error('此会话已由 CodexWatch 管理');
+          this.transferring.add(frame.chatId);
+          try {
+            this.store.poll();
+            const source = this.store.ensureDetail(frame.chatId);
+            if (!source) throw Error('会话不存在');
+            if (['running','waiting_input','waiting_approval'].includes(source.status) || source.spawn || source.pendingMsgs?.length) throw Error('会话仍在运行或有排队消息，请先结束任务并清空队列');
+            if ([...(this.runner.pending?.values() || [])].some(r => r.resumeOf === frame.chatId || r.boundChatId === frame.chatId)) throw Error('会话仍有正在启动的任务');
+            const version = source._recordVersion || 0;
+            const chat = await this.as.adoptThread(source, () => {
+              this.store.poll();
+              return (source._recordVersion || 0) === version && !['running','waiting_input','waiting_approval'].includes(source.status);
+            });
+            this.broadcast({t:'chat_update',chat:this.as.summary(chat)});
+            this.broadcast({t:'chat_reset',chatId:chat.id});
+            sink.send({t:'adopt_result',ref:frame.ref,ok:true,chatId:chat.id});
+          } finally {
+            this.transferring.delete(frame.chatId);
+            if (!this.as.chats.has(frame.chatId)) {
+              const original = this.store.get(frame.chatId);
+              if (original) { this.broadcast({t:'chat_update',chat:this.store.summary(original)}); this.broadcast({t:'chat_reset',chatId:frame.chatId}); }
+            }
+          }
+          break;
+        }
         case 'compact_context': {
           const found=this.findChat(frame.chatId);
           if(!found)throw Error('会话不存在');

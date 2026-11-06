@@ -1,5 +1,6 @@
-# 计划任务持有桥接进程，不随 Codex 窗口或账号切换结束。
+# 适用于计划任务；不依赖特定机器上的 Node 安装路径。
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
-& 'D:/soft/nvm4w/nodejs/node.exe' background-host.js
+$node = (Get-Command node.exe -ErrorAction Stop).Source
+& $node (Join-Path $PSScriptRoot 'background-host.js')
 exit $LASTEXITCODE
